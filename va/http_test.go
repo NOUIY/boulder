@@ -6,10 +6,11 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
-	mrand "math/rand"
+	mrand "math/rand/v2"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"net/url"
 	"regexp"
 	"strconv"
@@ -29,10 +30,6 @@ import (
 
 	"testing"
 )
-
-func httpChallenge() core.Challenge {
-	return createChallenge(core.ChallengeTypeHTTP01)
-}
 
 // TestDialerMismatchError tests that using a preresolvedDialer for one host for
 // a dial to another host produces the expected dialerMismatchError.
@@ -57,11 +54,24 @@ func TestDialerMismatchError(t *testing.T) {
 	test.AssertEquals(t, err.Error(), expectedErr.Error())
 }
 
-// TestPreresolvedDialerTimeout tests that the preresolvedDialer's DialContext
+// dnsMockReturnsUnroutable is a DNSClient mock that always returns an
+// unroutable address for LookupHost. This is useful in testing connect
+// timeouts.
+type dnsMockReturnsUnroutable struct {
+	*bdns.MockClient
+}
+
+func (mock dnsMockReturnsUnroutable) LookupHost(_ context.Context, hostname string) ([]net.IP, bdns.ResolverAddrs, error) {
+	return []net.IP{net.ParseIP("198.51.100.1")}, bdns.ResolverAddrs{"dnsMockReturnsUnroutable"}, nil
+}
+
+// TestDialerTimeout tests that the preresolvedDialer's DialContext
 // will timeout after the expected singleDialTimeout. This ensures timeouts at
-// the TCP level are handled correctly.
-func TestPreresolvedDialerTimeout(t *testing.T) {
-	va, _ := setup(nil, 0, "", nil, nil)
+// the TCP level are handled correctly. It also ensures that we show the client
+// the appropriate "Timeout during connect" error message, which helps clients
+// distinguish between firewall problems and server problems.
+func TestDialerTimeout(t *testing.T) {
+	va, _ := setup(nil, "", nil, nil)
 	// Timeouts below 50ms tend to be flaky.
 	va.singleDialTimeout = 50 * time.Millisecond
 
@@ -77,11 +87,11 @@ func TestPreresolvedDialerTimeout(t *testing.T) {
 	// If we get that, just retry until we get something other than "Network unreachable".
 	var err error
 	var took time.Duration
-	for i := 0; i < 20; i++ {
+	for range 20 {
 		started := time.Now()
-		_, _, err = va.fetchHTTP(ctx, "unroutable.invalid", "/.well-known/acme-challenge/whatever")
+		_, _, err = va.processHTTPValidation(ctx, "unroutable.invalid", "/.well-known/acme-challenge/whatever")
 		took = time.Since(started)
-		if err != nil && strings.Contains(err.Error(), "Network unreachable") {
+		if err != nil && strings.Contains(err.Error(), "network is unreachable") {
 			continue
 		} else {
 			break
@@ -94,20 +104,14 @@ func TestPreresolvedDialerTimeout(t *testing.T) {
 	// Check that the HTTP connection doesn't return too fast, and times
 	// out after the expected time
 	if took < va.singleDialTimeout {
-		t.Fatalf("fetch returned before %s (took: %s) with %#v", va.singleDialTimeout, took, err)
+		t.Fatalf("fetch returned before %s (took: %s) with %q", va.singleDialTimeout, took, err.Error())
 	}
 	if took > 2*va.singleDialTimeout {
 		t.Fatalf("fetch didn't timeout after %s (took: %s)", va.singleDialTimeout, took)
 	}
 	prob := detailedError(err)
 	test.AssertEquals(t, prob.Type, probs.ConnectionProblem)
-
-	expectMatch := regexp.MustCompile(
-		"Fetching http://unroutable.invalid/.well-known/acme-challenge/.*: Timeout during connect")
-	if !expectMatch.MatchString(prob.Detail) {
-		t.Errorf("Problem details incorrect. Got %q, expected to match %q",
-			prob.Detail, expectMatch)
-	}
+	test.AssertContains(t, prob.Detail, "Timeout during connect (likely firewall problem)")
 }
 
 func TestHTTPTransport(t *testing.T) {
@@ -163,7 +167,7 @@ func TestHTTPValidationTarget(t *testing.T) {
 		exampleQuery = "my-path=was&my=own"
 	)
 
-	va, _ := setup(nil, 0, "", nil, nil)
+	va, _ := setup(nil, "", nil, nil)
 	for _, tc := range testCases {
 		t.Run(tc.Name, func(t *testing.T) {
 			target, err := va.newHTTPValidationTarget(
@@ -184,7 +188,7 @@ func TestHTTPValidationTarget(t *testing.T) {
 				// Calling ip() on the target should give the expected IPs in the right
 				// order.
 				for i, expectedIP := range tc.ExpectedIPs {
-					gotIP := target.ip()
+					gotIP := target.cur
 					if gotIP == nil {
 						t.Errorf("Expected IP %d to be %s got nil", i, expectedIP)
 					} else {
@@ -294,7 +298,7 @@ func TestExtractRequestTarget(t *testing.T) {
 		},
 	}
 
-	va, _ := setup(nil, 0, "", nil, nil)
+	va, _ := setup(nil, "", nil, nil)
 	for _, tc := range testCases {
 		t.Run(tc.Name, func(t *testing.T) {
 			host, port, err := va.extractRequestTarget(tc.Req)
@@ -316,9 +320,9 @@ func TestExtractRequestTarget(t *testing.T) {
 // generates a DNS error, and checks that a log line with the detailed error is
 // generated.
 func TestHTTPValidationDNSError(t *testing.T) {
-	va, mockLog := setup(nil, 0, "", nil, nil)
+	va, mockLog := setup(nil, "", nil, nil)
 
-	_, _, prob := va.fetchHTTP(ctx, "always.error", "/.well-known/acme-challenge/whatever")
+	_, _, prob := va.processHTTPValidation(ctx, "always.error", "/.well-known/acme-challenge/whatever")
 	test.AssertError(t, prob, "Expected validation fetch to fail")
 	matchingLines := mockLog.GetAllMatching(`read udp: some net error`)
 	if len(matchingLines) != 1 {
@@ -332,9 +336,9 @@ func TestHTTPValidationDNSError(t *testing.T) {
 // the mock resolver results in valid query/response data being logged in
 // a format we can decode successfully.
 func TestHTTPValidationDNSIdMismatchError(t *testing.T) {
-	va, mockLog := setup(nil, 0, "", nil, nil)
+	va, mockLog := setup(nil, "", nil, nil)
 
-	_, _, prob := va.fetchHTTP(ctx, "id.mismatch", "/.well-known/acme-challenge/whatever")
+	_, _, prob := va.processHTTPValidation(ctx, "id.mismatch", "/.well-known/acme-challenge/whatever")
 	test.AssertError(t, prob, "Expected validation fetch to fail")
 	matchingLines := mockLog.GetAllMatching(`logDNSError ID mismatch`)
 	if len(matchingLines) != 1 {
@@ -371,7 +375,7 @@ func TestHTTPValidationDNSIdMismatchError(t *testing.T) {
 }
 
 func TestSetupHTTPValidation(t *testing.T) {
-	va, _ := setup(nil, 0, "", nil, nil)
+	va, _ := setup(nil, "", nil, nil)
 
 	mustTarget := func(t *testing.T, host string, port int, path string) *httpValidationTarget {
 		target, err := va.newHTTPValidationTarget(
@@ -417,9 +421,9 @@ func TestSetupHTTPValidation(t *testing.T) {
 				path: "idk",
 			},
 			ExpectedRecord: core.ValidationRecord{
-				URL:      "http://ipv4.and.ipv6.localhost/yellow/brick/road",
-				Hostname: "ipv4.and.ipv6.localhost",
-				Port:     strconv.Itoa(va.httpPort),
+				URL:     "http://ipv4.and.ipv6.localhost/yellow/brick/road",
+				DnsName: "ipv4.and.ipv6.localhost",
+				Port:    strconv.Itoa(va.httpPort),
 			},
 			ExpectedError: fmt.Errorf(`host "ipv4.and.ipv6.localhost" has no IP addresses remaining to use`),
 		},
@@ -428,7 +432,7 @@ func TestSetupHTTPValidation(t *testing.T) {
 			InputTarget: mustTarget(t, "ipv4.and.ipv6.localhost", va.httpPort, "/yellow/brick/road"),
 			InputURL:    httpInputURL,
 			ExpectedRecord: core.ValidationRecord{
-				Hostname:          "ipv4.and.ipv6.localhost",
+				DnsName:           "ipv4.and.ipv6.localhost",
 				Port:              strconv.Itoa(va.httpPort),
 				URL:               "http://ipv4.and.ipv6.localhost/yellow/brick/road",
 				AddressesResolved: []net.IP{net.ParseIP("::1"), net.ParseIP("127.0.0.1")},
@@ -446,7 +450,7 @@ func TestSetupHTTPValidation(t *testing.T) {
 			InputTarget: mustTarget(t, "ipv4.and.ipv6.localhost", va.httpsPort, "/yellow/brick/road"),
 			InputURL:    httpsInputURL,
 			ExpectedRecord: core.ValidationRecord{
-				Hostname:          "ipv4.and.ipv6.localhost",
+				DnsName:           "ipv4.and.ipv6.localhost",
 				Port:              strconv.Itoa(va.httpsPort),
 				URL:               "https://ipv4.and.ipv6.localhost/yellow/brick/road",
 				AddressesResolved: []net.IP{net.ParseIP("::1"), net.ParseIP("127.0.0.1")},
@@ -518,9 +522,7 @@ func httpTestSrv(t *testing.T) *httptest.Server {
 	// A path that sequentially redirects, creating an incrementing redirect
 	// that will terminate when the redirect limit is reached and ensures each
 	// URL is different than the last.
-	for i := 0; i <= maxRedirect+1; i++ {
-		// Need to re-scope i so it iterates properly in the function
-		i := i
+	for i := range maxRedirect + 2 {
 		mux.HandleFunc(fmt.Sprintf("/max-redirect/%d", i),
 			func(resp http.ResponseWriter, req *http.Request) {
 				http.Redirect(
@@ -579,7 +581,7 @@ func httpTestSrv(t *testing.T) *httptest.Server {
 	})
 
 	tooLargeBuf := bytes.NewBuffer([]byte{})
-	for i := 0; i < maxResponseSize+10; i++ {
+	for range maxResponseSize + 10 {
 		tooLargeBuf.WriteByte(byte(97))
 	}
 	mux.HandleFunc("/resp-too-big", func(resp http.ResponseWriter, req *http.Request) {
@@ -743,7 +745,7 @@ func TestFetchHTTP(t *testing.T) {
 
 	// Setup a VA. By providing the testSrv to setup the VA will use the testSrv's
 	// randomly assigned port as its HTTP port.
-	va, _ := setup(testSrv, 0, "", nil, nil)
+	va, _ := setup(testSrv, "", nil, nil)
 
 	// We need to know the randomly assigned HTTP port for testcases as well
 	httpPort := getPort(testSrv)
@@ -756,7 +758,7 @@ func TestFetchHTTP(t *testing.T) {
 	// redirect to the url with a port definition and on i=1 it will encounter
 	// the second redirect to the url with the port and get an expected error.
 	expectedLoopRecords := []core.ValidationRecord{}
-	for i := 0; i < 2; i++ {
+	for i := range 2 {
 		// The first request will not have a port # in the URL.
 		url := "http://example.com/loop"
 		if i != 0 {
@@ -764,7 +766,7 @@ func TestFetchHTTP(t *testing.T) {
 		}
 		expectedLoopRecords = append(expectedLoopRecords,
 			core.ValidationRecord{
-				Hostname:          "example.com",
+				DnsName:           "example.com",
 				Port:              strconv.Itoa(httpPort),
 				URL:               url,
 				AddressesResolved: []net.IP{net.ParseIP("127.0.0.1")},
@@ -777,7 +779,7 @@ func TestFetchHTTP(t *testing.T) {
 	// redirect up to maxRedirect (inclusive). There is also +1 record for the
 	// base lookup, giving a termination criteria of > maxRedirect+1
 	expectedTooManyRedirRecords := []core.ValidationRecord{}
-	for i := 0; i <= maxRedirect+1; i++ {
+	for i := range maxRedirect + 2 {
 		// The first request will not have a port # in the URL.
 		url := "http://example.com/max-redirect/0"
 		if i != 0 {
@@ -785,7 +787,7 @@ func TestFetchHTTP(t *testing.T) {
 		}
 		expectedTooManyRedirRecords = append(expectedTooManyRedirRecords,
 			core.ValidationRecord{
-				Hostname:          "example.com",
+				DnsName:           "example.com",
 				Port:              strconv.Itoa(httpPort),
 				URL:               url,
 				AddressesResolved: []net.IP{net.ParseIP("127.0.0.1")},
@@ -795,7 +797,7 @@ func TestFetchHTTP(t *testing.T) {
 	}
 
 	expectedTruncatedResp := bytes.NewBuffer([]byte{})
-	for i := 0; i < maxResponseSize; i++ {
+	for range maxResponseSize {
 		expectedTruncatedResp.WriteByte(byte(97))
 	}
 
@@ -826,7 +828,7 @@ func TestFetchHTTP(t *testing.T) {
 					"Timeout after connect (your server may be slow or overloaded)"),
 			ExpectedRecords: []core.ValidationRecord{
 				{
-					Hostname:          "example.com",
+					DnsName:           "example.com",
 					Port:              strconv.Itoa(httpPort),
 					URL:               "http://example.com/timeout",
 					AddressesResolved: []net.IP{net.ParseIP("127.0.0.1")},
@@ -844,7 +846,7 @@ func TestFetchHTTP(t *testing.T) {
 					"Error getting validation data"),
 			ExpectedRecords: []core.ValidationRecord{
 				{
-					Hostname:          "example.com:" + strconv.Itoa(httpPort),
+					DnsName:           "example.com:" + strconv.Itoa(httpPort),
 					Port:              strconv.Itoa(httpPort),
 					URL:               "http://example.com:" + strconv.Itoa(httpPort) + "/timeout",
 					AddressesResolved: []net.IP{net.ParseIP("127.0.0.1")},
@@ -879,7 +881,7 @@ func TestFetchHTTP(t *testing.T) {
 					`are supported, not "gopher"`),
 			ExpectedRecords: []core.ValidationRecord{
 				{
-					Hostname:          "example.com",
+					DnsName:           "example.com",
 					Port:              strconv.Itoa(httpPort),
 					URL:               "http://example.com/redir-bad-proto",
 					AddressesResolved: []net.IP{net.ParseIP("127.0.0.1")},
@@ -897,7 +899,7 @@ func TestFetchHTTP(t *testing.T) {
 					"Only ports %d and 443 are supported, not 1987", httpPort)),
 			ExpectedRecords: []core.ValidationRecord{
 				{
-					Hostname:          "example.com",
+					DnsName:           "example.com",
 					Port:              strconv.Itoa(httpPort),
 					URL:               "http://example.com/redir-bad-port",
 					AddressesResolved: []net.IP{net.ParseIP("127.0.0.1")},
@@ -915,7 +917,7 @@ func TestFetchHTTP(t *testing.T) {
 					`"127.0.0.1". Only domain names are supported, not IP addresses`),
 			ExpectedRecords: []core.ValidationRecord{
 				{
-					Hostname:          "example.com",
+					DnsName:           "example.com",
 					Port:              strconv.Itoa(httpPort),
 					URL:               "http://example.com/redir-bad-host",
 					AddressesResolved: []net.IP{net.ParseIP("127.0.0.1")},
@@ -932,7 +934,7 @@ func TestFetchHTTP(t *testing.T) {
 				"127.0.0.1: Fetching https://example.com/this-is-too-long-01234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789: Redirect target too long"),
 			ExpectedRecords: []core.ValidationRecord{
 				{
-					Hostname:          "example.com",
+					DnsName:           "example.com",
 					Port:              strconv.Itoa(httpPort),
 					URL:               "http://example.com/redir-path-too-long",
 					AddressesResolved: []net.IP{net.ParseIP("127.0.0.1")},
@@ -949,7 +951,7 @@ func TestFetchHTTP(t *testing.T) {
 				"127.0.0.1: Invalid response from http://example.com/bad-status-code: 410"),
 			ExpectedRecords: []core.ValidationRecord{
 				{
-					Hostname:          "example.com",
+					DnsName:           "example.com",
 					Port:              strconv.Itoa(httpPort),
 					URL:               "http://example.com/bad-status-code",
 					AddressesResolved: []net.IP{net.ParseIP("127.0.0.1")},
@@ -966,7 +968,7 @@ func TestFetchHTTP(t *testing.T) {
 				"127.0.0.1: Fetching http://example.org/303-see-other: received disallowed redirect status code"),
 			ExpectedRecords: []core.ValidationRecord{
 				{
-					Hostname:          "example.com",
+					DnsName:           "example.com",
 					Port:              strconv.Itoa(httpPort),
 					URL:               "http://example.com/303-see-other",
 					AddressesResolved: []net.IP{net.ParseIP("127.0.0.1")},
@@ -984,7 +986,7 @@ func TestFetchHTTP(t *testing.T) {
 			)),
 			ExpectedRecords: []core.ValidationRecord{
 				{
-					Hostname:          "example.com",
+					DnsName:           "example.com",
 					Port:              strconv.Itoa(httpPort),
 					URL:               "http://example.com/resp-too-big",
 					AddressesResolved: []net.IP{net.ParseIP("127.0.0.1")},
@@ -998,10 +1000,10 @@ func TestFetchHTTP(t *testing.T) {
 			Host: "ipv6.localhost",
 			Path: "/ok",
 			ExpectedProblem: probs.Connection(
-				"::1: Fetching http://ipv6.localhost/ok: Error getting validation data"),
+				"::1: Fetching http://ipv6.localhost/ok: Connection refused"),
 			ExpectedRecords: []core.ValidationRecord{
 				{
-					Hostname:          "ipv6.localhost",
+					DnsName:           "ipv6.localhost",
 					Port:              strconv.Itoa(httpPort),
 					URL:               "http://ipv6.localhost/ok",
 					AddressesResolved: []net.IP{net.ParseIP("::1")},
@@ -1017,7 +1019,7 @@ func TestFetchHTTP(t *testing.T) {
 			ExpectedBody: "ok",
 			ExpectedRecords: []core.ValidationRecord{
 				{
-					Hostname:          "ipv4.and.ipv6.localhost",
+					DnsName:           "ipv4.and.ipv6.localhost",
 					Port:              strconv.Itoa(httpPort),
 					URL:               "http://ipv4.and.ipv6.localhost/ok",
 					AddressesResolved: []net.IP{net.ParseIP("::1"), net.ParseIP("127.0.0.1")},
@@ -1026,7 +1028,7 @@ func TestFetchHTTP(t *testing.T) {
 					ResolverAddrs: []string{"MockClient"},
 				},
 				{
-					Hostname:          "ipv4.and.ipv6.localhost",
+					DnsName:           "ipv4.and.ipv6.localhost",
 					Port:              strconv.Itoa(httpPort),
 					URL:               "http://ipv4.and.ipv6.localhost/ok",
 					AddressesResolved: []net.IP{net.ParseIP("::1"), net.ParseIP("127.0.0.1")},
@@ -1043,7 +1045,7 @@ func TestFetchHTTP(t *testing.T) {
 			ExpectedBody: "ok",
 			ExpectedRecords: []core.ValidationRecord{
 				{
-					Hostname:          "example.com",
+					DnsName:           "example.com",
 					Port:              strconv.Itoa(httpPort),
 					URL:               "http://example.com/ok",
 					AddressesResolved: []net.IP{net.ParseIP("127.0.0.1")},
@@ -1059,7 +1061,7 @@ func TestFetchHTTP(t *testing.T) {
 			ExpectedBody: "ok",
 			ExpectedRecords: []core.ValidationRecord{
 				{
-					Hostname:          "example.com",
+					DnsName:           "example.com",
 					Port:              strconv.Itoa(httpPort),
 					URL:               "http://example.com/redir-uppercase-publicsuffix",
 					AddressesResolved: []net.IP{net.ParseIP("127.0.0.1")},
@@ -1067,7 +1069,7 @@ func TestFetchHTTP(t *testing.T) {
 					ResolverAddrs:     []string{"MockClient"},
 				},
 				{
-					Hostname:          "example.com",
+					DnsName:           "example.com",
 					Port:              strconv.Itoa(httpPort),
 					URL:               "http://example.com/ok",
 					AddressesResolved: []net.IP{net.ParseIP("127.0.0.1")},
@@ -1088,7 +1090,7 @@ func TestFetchHTTP(t *testing.T) {
 			},
 			ExpectedRecords: []core.ValidationRecord{
 				{
-					Hostname:          "example.com",
+					DnsName:           "example.com",
 					Port:              strconv.Itoa(httpPort),
 					URL:               "http://example.com/printf-verbs",
 					AddressesResolved: []net.IP{net.ParseIP("127.0.0.1")},
@@ -1103,15 +1105,15 @@ func TestFetchHTTP(t *testing.T) {
 		t.Run(tc.Name, func(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond*500)
 			defer cancel()
-			body, records, err := va.fetchHTTP(ctx, tc.Host, tc.Path)
-			if err != nil && tc.ExpectedProblem == nil {
-				t.Errorf("expected nil prob, got %#v\n", err)
-			} else if err == nil && tc.ExpectedProblem != nil {
-				t.Errorf("expected %#v prob, got nil", tc.ExpectedProblem)
-			} else if err != nil && tc.ExpectedProblem != nil {
+			body, records, err := va.processHTTPValidation(ctx, tc.Host, tc.Path)
+			if tc.ExpectedProblem == nil {
+				test.AssertNotError(t, err, "expected nil prob")
+			} else {
+				test.AssertError(t, err, "expected non-nil prob")
 				prob := detailedError(err)
 				test.AssertMarshaledEquals(t, prob, tc.ExpectedProblem)
-			} else {
+			}
+			if tc.ExpectedBody != "" {
 				test.AssertEquals(t, string(body), tc.ExpectedBody)
 			}
 			// in all cases we expect validation records to be present and matching expected
@@ -1214,15 +1216,15 @@ func TestHTTPBadPort(t *testing.T) {
 	hs := httpSrv(t, expectedToken)
 	defer hs.Close()
 
-	va, _ := setup(hs, 0, "", nil, nil)
+	va, _ := setup(hs, "", nil, nil)
 
 	// Pick a random port between 40000 and 65000 - with great certainty we won't
 	// have an HTTP server listening on this port and the test will fail as
 	// intended
-	badPort := 40000 + mrand.Intn(25000)
+	badPort := 40000 + mrand.IntN(25000)
 	va.httpPort = badPort
 
-	_, err := va.validateHTTP01(ctx, dnsi("localhost"), httpChallenge())
+	_, err := va.validateHTTP01(ctx, dnsi("localhost"), expectedToken, expectedKeyAuthorization)
 	if err == nil {
 		t.Fatalf("Server's down; expected refusal. Where did we connect?")
 	}
@@ -1241,42 +1243,32 @@ func TestHTTPKeyAuthorizationFileMismatch(t *testing.T) {
 	})
 	hs.Start()
 
-	va, _ := setup(hs, 0, "", nil, nil)
-	_, err := va.validateHTTP01(ctx, dnsi("localhost.com"), httpChallenge())
+	va, _ := setup(hs, "", nil, nil)
+	_, err := va.validateHTTP01(ctx, dnsi("localhost.com"), expectedToken, expectedKeyAuthorization)
 
 	if err == nil {
 		t.Fatalf("Expected validation to fail when file mismatched.")
 	}
-	expected := `The key authorization file from the server did not match this challenge. Expected "LoqXcYV8q5ONbJQxbmR7SCTNo3tiAXDfowyjxAjEuX0.9jg46WB3rR_AHD-EBXdN7cBkH1WOu0tA3M9fm21mqTI" (got "\xef\xffAABBCC")`
+	expected := fmt.Sprintf(`The key authorization file from the server did not match this challenge. Expected "%s" (got "\xef\xffAABBCC")`, expectedKeyAuthorization)
 	if err.Error() != expected {
 		t.Errorf("validation failed with %s, expected %s", err, expected)
 	}
 }
 
 func TestHTTP(t *testing.T) {
-	// NOTE: We do not attempt to shut down the server. The problem is that the
-	// "wait-long" handler sleeps for ten seconds, but this test finishes in less
-	// than that. So if we try to call hs.Close() at the end of the test, we'll be
-	// closing the test server while a request is still pending. Unfortunately,
-	// there appears to be an issue in httptest that trips Go's race detector when
-	// that happens, failing the test. So instead, we live with leaving the server
-	// around till the process exits.
-	// TODO(#1989): close hs
 	hs := httpSrv(t, expectedToken)
+	defer hs.Close()
 
-	va, log := setup(hs, 0, "", nil, nil)
+	va, log := setup(hs, "", nil, nil)
 
-	chall := httpChallenge()
-	t.Logf("Trying to validate: %+v\n", chall)
-	_, err := va.validateHTTP01(ctx, dnsi("localhost.com"), chall)
+	_, err := va.validateHTTP01(ctx, dnsi("localhost.com"), expectedToken, expectedKeyAuthorization)
 	if err != nil {
 		t.Errorf("Unexpected failure in HTTP validation: %s", err)
 	}
 	test.AssertEquals(t, len(log.GetAllMatching(`\[AUDIT\] `)), 1)
 
 	log.Clear()
-	setChallengeToken(&chall, path404)
-	_, err = va.validateHTTP01(ctx, dnsi("localhost.com"), chall)
+	_, err = va.validateHTTP01(ctx, dnsi("localhost.com"), path404, ka(path404))
 	if err == nil {
 		t.Fatalf("Should have found a 404 for the challenge.")
 	}
@@ -1284,10 +1276,9 @@ func TestHTTP(t *testing.T) {
 	test.AssertEquals(t, len(log.GetAllMatching(`\[AUDIT\] `)), 1)
 
 	log.Clear()
-	setChallengeToken(&chall, pathWrongToken)
 	// The "wrong token" will actually be the expectedToken.  It's wrong
 	// because it doesn't match pathWrongToken.
-	_, err = va.validateHTTP01(ctx, dnsi("localhost.com"), chall)
+	_, err = va.validateHTTP01(ctx, dnsi("localhost.com"), pathWrongToken, ka(pathWrongToken))
 	if err == nil {
 		t.Fatalf("Should have found the wrong token value.")
 	}
@@ -1296,8 +1287,7 @@ func TestHTTP(t *testing.T) {
 	test.AssertEquals(t, len(log.GetAllMatching(`\[AUDIT\] `)), 1)
 
 	log.Clear()
-	setChallengeToken(&chall, pathMoved)
-	_, err = va.validateHTTP01(ctx, dnsi("localhost.com"), chall)
+	_, err = va.validateHTTP01(ctx, dnsi("localhost.com"), pathMoved, ka(pathMoved))
 	if err != nil {
 		t.Fatalf("Failed to follow http.StatusMovedPermanently redirect")
 	}
@@ -1306,8 +1296,7 @@ func TestHTTP(t *testing.T) {
 	test.AssertEquals(t, len(matchedValidRedirect), 1)
 
 	log.Clear()
-	setChallengeToken(&chall, pathFound)
-	_, err = va.validateHTTP01(ctx, dnsi("localhost.com"), chall)
+	_, err = va.validateHTTP01(ctx, dnsi("localhost.com"), pathFound, ka(pathFound))
 	if err != nil {
 		t.Fatalf("Failed to follow http.StatusFound redirect")
 	}
@@ -1316,14 +1305,13 @@ func TestHTTP(t *testing.T) {
 	test.AssertEquals(t, len(matchedValidRedirect), 1)
 	test.AssertEquals(t, len(matchedMovedRedirect), 1)
 
-	ipIdentifier := identifier.ACMEIdentifier{Type: identifier.IdentifierType("ip"), Value: "127.0.0.1"}
-	_, err = va.validateHTTP01(ctx, ipIdentifier, chall)
+	_, err = va.validateHTTP01(ctx, identifier.NewIP(netip.MustParseAddr("127.0.0.1")), pathFound, ka(pathFound))
 	if err == nil {
 		t.Fatalf("IdentifierType IP shouldn't have worked.")
 	}
 	test.AssertErrorIs(t, err, berrors.Malformed)
 
-	_, err = va.validateHTTP01(ctx, identifier.ACMEIdentifier{Type: identifier.DNS, Value: "always.invalid"}, chall)
+	_, err = va.validateHTTP01(ctx, identifier.NewDNS("always.invalid"), pathFound, ka(pathFound))
 	if err == nil {
 		t.Fatalf("Domain name is invalid.")
 	}
@@ -1333,18 +1321,15 @@ func TestHTTP(t *testing.T) {
 
 func TestHTTPTimeout(t *testing.T) {
 	hs := httpSrv(t, expectedToken)
-	// TODO(#1989): close hs
+	defer hs.Close()
 
-	va, _ := setup(hs, 0, "", nil, nil)
-
-	chall := httpChallenge()
-	setChallengeToken(&chall, pathWaitLong)
+	va, _ := setup(hs, "", nil, nil)
 
 	started := time.Now()
 	timeout := 250 * time.Millisecond
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-	_, err := va.validateHTTP01(ctx, dnsi("localhost"), chall)
+	_, err := va.validateHTTP01(ctx, dnsi("localhost"), pathWaitLong, ka(pathWaitLong))
 	if err == nil {
 		t.Fatalf("Connection should've timed out")
 	}
@@ -1363,72 +1348,12 @@ func TestHTTPTimeout(t *testing.T) {
 	test.AssertEquals(t, prob.Detail, "127.0.0.1: Fetching http://localhost/.well-known/acme-challenge/wait-long: Timeout after connect (your server may be slow or overloaded)")
 }
 
-// dnsMockReturnsUnroutable is a DNSClient mock that always returns an
-// unroutable address for LookupHost. This is useful in testing connect
-// timeouts.
-type dnsMockReturnsUnroutable struct {
-	*bdns.MockClient
-}
-
-func (mock dnsMockReturnsUnroutable) LookupHost(_ context.Context, hostname string) ([]net.IP, bdns.ResolverAddrs, error) {
-	return []net.IP{net.ParseIP("198.51.100.1")}, bdns.ResolverAddrs{"dnsMockReturnsUnroutable"}, nil
-}
-
-// TestHTTPDialTimeout tests that we give the proper "Timeout during connect"
-// error when dial fails. We do this by using a mock DNS client that resolves
-// everything to an unroutable IP address.
-func TestHTTPDialTimeout(t *testing.T) {
-	va, _ := setup(nil, 0, "", nil, nil)
-
-	started := time.Now()
-	timeout := 250 * time.Millisecond
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
-
-	va.dnsClient = dnsMockReturnsUnroutable{&bdns.MockClient{}}
-	// The only method I've found so far to trigger a connect timeout is to
-	// connect to an unrouteable IP address. This usually generates a connection
-	// timeout, but will rarely return "Network unreachable" instead. If we get
-	// that, just retry until we get something other than "Network unreachable".
-	var err error
-	for i := 0; i < 20; i++ {
-		_, err = va.validateHTTP01(ctx, dnsi("unroutable.invalid"), httpChallenge())
-		if err != nil && strings.Contains(err.Error(), "Network unreachable") {
-			continue
-		} else {
-			break
-		}
-	}
-	if err == nil {
-		t.Fatalf("Connection should've timed out")
-	}
-	took := time.Since(started)
-	// Check that the HTTP connection doesn't return too fast, and times
-	// out after the expected time
-	if took < (timeout-200*time.Millisecond)/2 {
-		t.Fatalf("HTTP returned before %s (%s) with %#v", timeout, took, err)
-	}
-	if took > 2*timeout {
-		t.Fatalf("HTTP connection didn't timeout after %s seconds", timeout)
-	}
-	prob := detailedError(err)
-	test.AssertEquals(t, prob.Type, probs.ConnectionProblem)
-	expectMatch := regexp.MustCompile(
-		"Fetching http://unroutable.invalid/.well-known/acme-challenge/.*: Timeout during connect")
-	if !expectMatch.MatchString(prob.Detail) {
-		t.Errorf("Problem details incorrect. Got %q, expected to match %q",
-			prob.Detail, expectMatch)
-	}
-}
-
 func TestHTTPRedirectLookup(t *testing.T) {
 	hs := httpSrv(t, expectedToken)
 	defer hs.Close()
-	va, log := setup(hs, 0, "", nil, nil)
+	va, log := setup(hs, "", nil, nil)
 
-	chall := httpChallenge()
-	setChallengeToken(&chall, pathMoved)
-	_, err := va.validateHTTP01(ctx, dnsi("localhost.com"), chall)
+	_, err := va.validateHTTP01(ctx, dnsi("localhost.com"), pathMoved, ka(pathMoved))
 	if err != nil {
 		t.Fatalf("Unexpected failure in redirect (%s): %s", pathMoved, err)
 	}
@@ -1438,8 +1363,7 @@ func TestHTTPRedirectLookup(t *testing.T) {
 	test.AssertEquals(t, len(log.GetAllMatching(`Resolved addresses for localhost.com: \[127.0.0.1\]`)), 2)
 
 	log.Clear()
-	setChallengeToken(&chall, pathFound)
-	_, err = va.validateHTTP01(ctx, dnsi("localhost.com"), chall)
+	_, err = va.validateHTTP01(ctx, dnsi("localhost.com"), pathFound, ka(pathFound))
 	if err != nil {
 		t.Fatalf("Unexpected failure in redirect (%s): %s", pathFound, err)
 	}
@@ -1449,16 +1373,14 @@ func TestHTTPRedirectLookup(t *testing.T) {
 	test.AssertEquals(t, len(log.GetAllMatching(`Resolved addresses for localhost.com: \[127.0.0.1\]`)), 3)
 
 	log.Clear()
-	setChallengeToken(&chall, pathReLookupInvalid)
-	_, err = va.validateHTTP01(ctx, dnsi("localhost.com"), chall)
-	test.AssertError(t, err, chall.Token)
+	_, err = va.validateHTTP01(ctx, dnsi("localhost.com"), pathReLookupInvalid, ka(pathReLookupInvalid))
+	test.AssertError(t, err, "error for pathReLookupInvalid should not be nil")
 	test.AssertEquals(t, len(log.GetAllMatching(`Resolved addresses for localhost.com: \[127.0.0.1\]`)), 1)
 	prob := detailedError(err)
 	test.AssertDeepEquals(t, prob, probs.Connection(`127.0.0.1: Fetching http://invalid.invalid/path: Invalid hostname in redirect target, must end in IANA registered TLD`))
 
 	log.Clear()
-	setChallengeToken(&chall, pathReLookup)
-	_, err = va.validateHTTP01(ctx, dnsi("localhost.com"), chall)
+	_, err = va.validateHTTP01(ctx, dnsi("localhost.com"), pathReLookup, ka(pathReLookup))
 	if err != nil {
 		t.Fatalf("Unexpected error in redirect (%s): %s", pathReLookup, err)
 	}
@@ -1468,8 +1390,7 @@ func TestHTTPRedirectLookup(t *testing.T) {
 	test.AssertEquals(t, len(log.GetAllMatching(`Resolved addresses for other.valid.com: \[127.0.0.1\]`)), 1)
 
 	log.Clear()
-	setChallengeToken(&chall, pathRedirectInvalidPort)
-	_, err = va.validateHTTP01(ctx, dnsi("localhost.com"), chall)
+	_, err = va.validateHTTP01(ctx, dnsi("localhost.com"), pathRedirectInvalidPort, ka(pathRedirectInvalidPort))
 	test.AssertNotNil(t, err, "error for pathRedirectInvalidPort should not be nil")
 	prob = detailedError(err)
 	test.AssertEquals(t, prob.Detail, fmt.Sprintf(
@@ -1480,8 +1401,7 @@ func TestHTTPRedirectLookup(t *testing.T) {
 	// HTTP 500 errors. The test case is ensuring that the connection error
 	// is referencing the redirected to host, instead of the original host.
 	log.Clear()
-	setChallengeToken(&chall, pathRedirectToFailingURL)
-	_, err = va.validateHTTP01(ctx, dnsi("localhost.com"), chall)
+	_, err = va.validateHTTP01(ctx, dnsi("localhost.com"), pathRedirectToFailingURL, ka(pathRedirectToFailingURL))
 	test.AssertNotNil(t, err, "err should not be nil")
 	prob = detailedError(err)
 	test.AssertDeepEquals(t, prob,
@@ -1493,31 +1413,26 @@ func TestHTTPRedirectLookup(t *testing.T) {
 func TestHTTPRedirectLoop(t *testing.T) {
 	hs := httpSrv(t, expectedToken)
 	defer hs.Close()
-	va, _ := setup(hs, 0, "", nil, nil)
+	va, _ := setup(hs, "", nil, nil)
 
-	chall := httpChallenge()
-	setChallengeToken(&chall, "looper")
-	_, prob := va.validateHTTP01(ctx, dnsi("localhost"), chall)
+	_, prob := va.validateHTTP01(ctx, dnsi("localhost"), "looper", ka("looper"))
 	if prob == nil {
-		t.Fatalf("Challenge should have failed for %s", chall.Token)
+		t.Fatalf("Challenge should have failed for looper")
 	}
 }
 
 func TestHTTPRedirectUserAgent(t *testing.T) {
 	hs := httpSrv(t, expectedToken)
 	defer hs.Close()
-	va, _ := setup(hs, 0, "", nil, nil)
+	va, _ := setup(hs, "", nil, nil)
 	va.userAgent = rejectUserAgent
 
-	chall := httpChallenge()
-	setChallengeToken(&chall, pathMoved)
-	_, prob := va.validateHTTP01(ctx, dnsi("localhost"), chall)
+	_, prob := va.validateHTTP01(ctx, dnsi("localhost"), pathMoved, ka(pathMoved))
 	if prob == nil {
 		t.Fatalf("Challenge with rejectUserAgent should have failed (%s).", pathMoved)
 	}
 
-	setChallengeToken(&chall, pathFound)
-	_, prob = va.validateHTTP01(ctx, dnsi("localhost"), chall)
+	_, prob = va.validateHTTP01(ctx, dnsi("localhost"), pathFound, ka(pathFound))
 	if prob == nil {
 		t.Fatalf("Challenge with rejectUserAgent should have failed (%s).", pathFound)
 	}
@@ -1540,27 +1455,25 @@ func getPort(hs *httptest.Server) int {
 }
 
 func TestValidateHTTP(t *testing.T) {
-	chall := core.HTTPChallenge01("")
-	setChallengeToken(&chall, core.NewToken())
+	token := core.NewToken()
 
-	hs := httpSrv(t, chall.Token)
+	hs := httpSrv(t, token)
 	defer hs.Close()
 
-	va, _ := setup(hs, 0, "", nil, nil)
+	va, _ := setup(hs, "", nil, nil)
 
-	_, prob := va.validateChallenge(ctx, dnsi("localhost"), chall)
+	_, prob := va.validateHTTP01(ctx, dnsi("localhost"), token, ka(token))
 	test.Assert(t, prob == nil, "validation failed")
 }
 
 func TestLimitedReader(t *testing.T) {
-	chall := core.HTTPChallenge01("")
-	setChallengeToken(&chall, core.NewToken())
+	token := core.NewToken()
 
 	hs := httpSrv(t, "012345\xff67890123456789012345678901234567890123456789012345678901234567890123456789")
-	va, _ := setup(hs, 0, "", nil, nil)
+	va, _ := setup(hs, "", nil, nil)
 	defer hs.Close()
 
-	_, err := va.validateChallenge(ctx, dnsi("localhost"), chall)
+	_, err := va.validateHTTP01(ctx, dnsi("localhost"), token, ka(token))
 
 	prob := detailedError(err)
 	test.AssertEquals(t, prob.Type, probs.UnauthorizedProblem)

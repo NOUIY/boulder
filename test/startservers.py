@@ -16,13 +16,17 @@ Service = collections.namedtuple('Service', ('name', 'debug_port', 'grpc_port', 
 
 # Keep these ports in sync with consul/config.hcl
 SERVICES = (
-    Service('boulder-remoteva-a',
+    Service('remoteva-a',
         8011, 9397, 'rva.boulder',
-        ('./bin/boulder', 'boulder-remoteva', '--config', os.path.join(config_dir, 'va-remote-a.json'), '--addr', ':9397', '--debug-addr', ':8011'),
+        ('./bin/boulder', 'remoteva', '--config', os.path.join(config_dir, 'remoteva-a.json'), '--addr', ':9397', '--debug-addr', ':8011'),
         None),
-    Service('boulder-remoteva-b',
+    Service('remoteva-b',
         8012, 9498, 'rva.boulder',
-        ('./bin/boulder', 'boulder-remoteva', '--config', os.path.join(config_dir, 'va-remote-b.json'), '--addr', ':9498', '--debug-addr', ':8012'),
+        ('./bin/boulder', 'remoteva', '--config', os.path.join(config_dir, 'remoteva-b.json'), '--addr', ':9498', '--debug-addr', ':8012'),
+        None),
+    Service('remoteva-c',
+        8023, 9499, 'rva.boulder',
+        ('./bin/boulder', 'remoteva', '--config', os.path.join(config_dir, 'remoteva-c.json'), '--addr', ':9499', '--debug-addr', ':8023'),
         None),
     Service('boulder-sa-1',
         8003, 9395, 'sa.boulder',
@@ -32,8 +36,11 @@ SERVICES = (
         8103, 9495, 'sa.boulder',
         ('./bin/boulder', 'boulder-sa', '--config', os.path.join(config_dir, 'sa.json'), '--addr', ':9495', '--debug-addr', ':8103'),
         None),
+    Service('aia-test-srv',
+        4502, None, None,
+        ('./bin/aia-test-srv', '--addr', ':4502', '--hierarchy', 'test/certs/webpki/'), None),
     Service('ct-test-srv',
-        4500, None, None,
+        4600, None, None,
         ('./bin/ct-test-srv', '--config', 'test/ct-test-srv/ct-test-srv.json'), None),
     Service('boulder-publisher-1',
         8009, 9391, 'publisher.boulder',
@@ -45,7 +52,7 @@ SERVICES = (
         None),
     Service('mail-test-srv',
         9380, None, None,
-        ('./bin/mail-test-srv', '--closeFirst', '5', '--cert', 'test/mail-test-srv/localhost/cert.pem', '--key', 'test/mail-test-srv/localhost/key.pem'),
+        ('./bin/mail-test-srv', '--closeFirst', '5', '--cert', 'test/certs/ipki/localhost/cert.pem', '--key', 'test/certs/ipki/localhost/key.pem'),
         None),
     Service('ocsp-responder',
         8005, None, None,
@@ -54,11 +61,11 @@ SERVICES = (
     Service('boulder-va-1',
         8004, 9392, 'va.boulder',
         ('./bin/boulder', 'boulder-va', '--config', os.path.join(config_dir, 'va.json'), '--addr', ':9392', '--debug-addr', ':8004'),
-        ('boulder-remoteva-a', 'boulder-remoteva-b')),
+        ('remoteva-a', 'remoteva-b')),
     Service('boulder-va-2',
         8104, 9492, 'va.boulder',
         ('./bin/boulder', 'boulder-va', '--config', os.path.join(config_dir, 'va.json'), '--addr', ':9492', '--debug-addr', ':8104'),
-        ('boulder-remoteva-a', 'boulder-remoteva-b')),
+        ('remoteva-a', 'remoteva-b')),
     Service('boulder-ca-1',
         8001, 9393, 'ca.boulder',
         ('./bin/boulder', 'boulder-ca', '--config', os.path.join(config_dir, 'ca.json'), '--addr', ':9393', '--debug-addr', ':8001'),
@@ -76,8 +83,8 @@ SERVICES = (
         ('./bin/boulder', 'akamai-purger', '--addr', ':9399', '--config', os.path.join(config_dir, 'akamai-purger.json'), '--debug-addr', ':9666'),
         ('akamai-test-srv',)),
     Service('s3-test-srv',
-        7890, None, None,
-        ('./bin/s3-test-srv', '--listen', 'localhost:7890'),
+        4501, None, None,
+        ('./bin/s3-test-srv', '--listen', ':4501'),
         None),
     Service('crl-storer',
         9667, None, None,
@@ -122,6 +129,10 @@ SERVICES = (
         4001, None, None,
         ('./bin/boulder', 'boulder-wfe2', '--config', os.path.join(config_dir, 'wfe2.json'), '--addr', ':4001', '--tls-addr', ':4431', '--debug-addr', ':8013'),
         ('boulder-ra-1', 'boulder-ra-2', 'boulder-sa-1', 'boulder-sa-2', 'nonce-service-taro-1', 'nonce-service-taro-2', 'nonce-service-zinc-1')),
+    Service('sfe',
+        4003, None, None,
+        ('./bin/boulder', 'sfe', '--config', os.path.join(config_dir, 'sfe.json'), '--addr', ':4003', '--debug-addr', ':8015'),
+        ('boulder-ra-1', 'boulder-ra-2', 'boulder-sa-1', 'boulder-sa-2',)),
     Service('log-validator',
         8016, None, None,
         ('./bin/boulder', 'log-validator', '--config', os.path.join(config_dir, 'log-validator.json'), '--debug-addr', ':8016'),
@@ -156,17 +167,6 @@ processes = []
 # processes because we want integration tests to be able to stop/start it (e.g.
 # to run the load-generator).
 challSrvProcess = None
-
-def setupHierarchy():
-    """Set up the issuance hierarchy. Must have called install() before this."""
-    e = os.environ.copy()
-    e.setdefault("GOBIN", "%s/bin" % os.getcwd())
-    try:
-        subprocess.check_output(["go", "run", "test/cert-ceremonies/generate.go"], env=e)
-    except subprocess.CalledProcessError as e:
-        print(e.output)
-        raise
-
 
 def install(race_detection):
     # Pass empty BUILD_TIME and BUILD_ID flags to avoid constantly invalidating the
@@ -271,8 +271,8 @@ def startChallSrv():
         '-defaultIPv6', '',
         '--dns01', ':8053,:8054',
         '--doh', ':8343,:8443',
-        '--doh-cert', 'test/grpc-creds/10.77.77.77/cert.pem',
-        '--doh-cert-key', 'test/grpc-creds/10.77.77.77/key.pem',
+        '--doh-cert', 'test/certs/ipki/10.77.77.77/cert.pem',
+        '--doh-cert-key', 'test/certs/ipki/10.77.77.77/key.pem',
         '--management', ':8055',
         '--http01', '10.77.77.77:80',
         '-https01', '10.77.77.77:443',

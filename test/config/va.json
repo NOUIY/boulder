@@ -14,9 +14,9 @@
 		"dnsAllowLoopbackAddresses": true,
 		"issuerDomain": "happy-hacker-ca.invalid",
 		"tls": {
-			"caCertfile": "test/grpc-creds/minica.pem",
-			"certFile": "test/grpc-creds/va.boulder/cert.pem",
-			"keyFile": "test/grpc-creds/va.boulder/key.pem"
+			"caCertfile": "test/certs/ipki/minica.pem",
+			"certFile": "test/certs/ipki/va.boulder/cert.pem",
+			"keyFile": "test/certs/ipki/va.boulder/key.pem"
 		},
 		"grpc": {
 			"maxConnectionAge": "30s",
@@ -38,20 +38,28 @@
 				}
 			}
 		},
-		"features": {
-			"EnforceMultiVA": true,
-			"MultiVAFullResults": true
-		},
+		"features": {},
 		"remoteVAs": [
 			{
 				"serverAddress": "rva1.service.consul:9397",
 				"timeout": "15s",
-				"hostOverride": "rva1.boulder"
+				"hostOverride": "rva1.boulder",
+				"perspective": "dadaist",
+				"rir": "ARIN"
 			},
 			{
 				"serverAddress": "rva1.service.consul:9498",
 				"timeout": "15s",
-				"hostOverride": "rva1.boulder"
+				"hostOverride": "rva1.boulder",
+				"perspective": "surrealist",
+				"rir": "RIPE"
+			},
+			{
+				"serverAddress": "rva1.service.consul:9499",
+				"timeout": "15s",
+				"hostOverride": "rva1.boulder",
+				"perspective": "cubist",
+				"rir": "ARIN"
 			}
 		],
 		"maxRemoteValidationFailures": 1,

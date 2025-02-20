@@ -18,11 +18,9 @@ CREATE USER IF NOT EXISTS 'proxysql'@'localhost';
 GRANT SELECT,INSERT ON certificates TO 'sa'@'localhost';
 GRANT SELECT,INSERT,UPDATE ON certificateStatus TO 'sa'@'localhost';
 GRANT SELECT,INSERT ON issuedNames TO 'sa'@'localhost';
-GRANT SELECT,INSERT,UPDATE ON certificatesPerName TO 'sa'@'localhost';
 GRANT SELECT,INSERT,UPDATE ON registrations TO 'sa'@'localhost';
 GRANT SELECT,INSERT on fqdnSets TO 'sa'@'localhost';
 GRANT SELECT,INSERT,UPDATE ON orders TO 'sa'@'localhost';
-GRANT SELECT,INSERT ON requestedNames TO 'sa'@'localhost';
 GRANT SELECT,INSERT,DELETE ON orderFqdnSets TO 'sa'@'localhost';
 GRANT SELECT,INSERT,UPDATE ON authz2 TO 'sa'@'localhost';
 GRANT SELECT,INSERT ON orderToAuthz2 TO 'sa'@'localhost';
@@ -30,20 +28,19 @@ GRANT INSERT,SELECT ON serials TO 'sa'@'localhost';
 GRANT SELECT,INSERT ON precertificates TO 'sa'@'localhost';
 GRANT SELECT,INSERT ON keyHashToSerial TO 'sa'@'localhost';
 GRANT SELECT,INSERT ON blockedKeys TO 'sa'@'localhost';
-GRANT SELECT,INSERT,UPDATE ON newOrdersRL TO 'sa'@'localhost';
 GRANT SELECT ON incidents TO 'sa'@'localhost';
 GRANT SELECT,INSERT,UPDATE ON crlShards TO 'sa'@'localhost';
 GRANT SELECT,INSERT,UPDATE ON revokedCertificates TO 'sa'@'localhost';
 GRANT SELECT,INSERT,UPDATE ON replacementOrders TO 'sa'@'localhost';
+-- Tests need to be able to TRUNCATE this table, so DROP is necessary.
+GRANT SELECT,INSERT,UPDATE,DROP ON paused TO 'sa'@'localhost';
 
 GRANT SELECT ON certificates TO 'sa_ro'@'localhost';
 GRANT SELECT ON certificateStatus TO 'sa_ro'@'localhost';
 GRANT SELECT ON issuedNames TO 'sa_ro'@'localhost';
-GRANT SELECT ON certificatesPerName TO 'sa_ro'@'localhost';
 GRANT SELECT ON registrations TO 'sa_ro'@'localhost';
 GRANT SELECT on fqdnSets TO 'sa_ro'@'localhost';
 GRANT SELECT ON orders TO 'sa_ro'@'localhost';
-GRANT SELECT ON requestedNames TO 'sa_ro'@'localhost';
 GRANT SELECT ON orderFqdnSets TO 'sa_ro'@'localhost';
 GRANT SELECT ON authz2 TO 'sa_ro'@'localhost';
 GRANT SELECT ON orderToAuthz2 TO 'sa_ro'@'localhost';
@@ -51,11 +48,11 @@ GRANT SELECT ON serials TO 'sa_ro'@'localhost';
 GRANT SELECT ON precertificates TO 'sa_ro'@'localhost';
 GRANT SELECT ON keyHashToSerial TO 'sa_ro'@'localhost';
 GRANT SELECT ON blockedKeys TO 'sa_ro'@'localhost';
-GRANT SELECT ON newOrdersRL TO 'sa_ro'@'localhost';
 GRANT SELECT ON incidents TO 'sa_ro'@'localhost';
 GRANT SELECT ON crlShards TO 'sa_ro'@'localhost';
 GRANT SELECT ON revokedCertificates TO 'sa_ro'@'localhost';
 GRANT SELECT ON replacementOrders TO 'sa_ro'@'localhost';
+GRANT SELECT ON paused TO 'sa_ro'@'localhost';
 
 -- OCSP Responder
 GRANT SELECT ON certificateStatus TO 'ocsp_resp'@'localhost';
@@ -76,6 +73,7 @@ GRANT SELECT ON fqdnSets TO 'mailer'@'localhost';
 -- Cert checker
 GRANT SELECT ON certificates TO 'cert_checker'@'localhost';
 GRANT SELECT ON authz2 TO 'cert_checker'@'localhost';
+GRANT SELECT ON precertificates TO 'cert_checker'@'localhost';
 
 -- Bad Key Revoker
 GRANT SELECT,UPDATE ON blockedKeys TO 'badkeyrevoker'@'localhost';

@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"gopkg.in/go-jose/go-jose.v2"
+	"github.com/go-jose/go-jose/v4"
 
 	"github.com/letsencrypt/boulder/test"
 )
@@ -37,7 +37,7 @@ func TestRecordSanityCheckOnUnsupportedChallengeType(t *testing.T) {
 	rec := []ValidationRecord{
 		{
 			URL:               "http://localhost/test",
-			Hostname:          "localhost",
+			DnsName:           "localhost",
 			Port:              "80",
 			AddressesResolved: []net.IP{{127, 0, 0, 1}},
 			AddressUsed:       net.IP{127, 0, 0, 1},
@@ -65,24 +65,14 @@ func TestChallengeSanityCheck(t *testing.T) {
 			Type:   challengeType,
 			Status: StatusInvalid,
 		}
-		test.AssertError(t, chall.CheckConsistencyForClientOffer(), "CheckConsistencyForClientOffer didn't return an error")
+		test.AssertError(t, chall.CheckPending(), "CheckConsistencyForClientOffer didn't return an error")
 
 		chall.Status = StatusPending
-		test.AssertError(t, chall.CheckConsistencyForClientOffer(), "CheckConsistencyForClientOffer didn't return an error")
+		test.AssertError(t, chall.CheckPending(), "CheckConsistencyForClientOffer didn't return an error")
 
 		chall.Token = "KQqLsiS5j0CONR_eUXTUSUDNVaHODtc-0pD6ACif7U4"
-		test.AssertNotError(t, chall.CheckConsistencyForClientOffer(), "CheckConsistencyForClientOffer returned an error")
-
-		chall.ProvidedKeyAuthorization = chall.Token + ".AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-		test.AssertNotError(t, chall.CheckConsistencyForValidation(), "CheckConsistencyForValidation returned an error")
-
-		chall.ProvidedKeyAuthorization = "aaaa.aaaa"
-		test.AssertError(t, chall.CheckConsistencyForValidation(), "CheckConsistencyForValidation didn't return an error")
+		test.AssertNotError(t, chall.CheckPending(), "CheckConsistencyForClientOffer returned an error")
 	}
-
-	chall := Challenge{Type: "bogus", Status: StatusPending}
-	test.AssertError(t, chall.CheckConsistencyForClientOffer(), "CheckConsistencyForClientOffer didn't return an error")
-	test.AssertError(t, chall.CheckConsistencyForValidation(), "CheckConsistencyForValidation didn't return an error")
 }
 
 func TestJSONBufferUnmarshal(t *testing.T) {
@@ -110,7 +100,7 @@ func TestAuthorizationSolvedBy(t *testing.T) {
 		{
 			Name:          "No challenges",
 			Authz:         Authorization{},
-			ExpectedError: "Authorization has no challenges",
+			ExpectedError: "authorization has no challenges",
 		},
 		// An authz with all non-valid challenges should return nil
 		{
@@ -118,7 +108,7 @@ func TestAuthorizationSolvedBy(t *testing.T) {
 			Authz: Authorization{
 				Challenges: []Challenge{HTTPChallenge01(""), DNSChallenge01("")},
 			},
-			ExpectedError: "Authorization not solved by any challenge",
+			ExpectedError: "authorization not solved by any challenge",
 		},
 		// An authz with one valid HTTP01 challenge amongst other challenges should
 		// return the HTTP01 challenge

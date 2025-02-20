@@ -14,9 +14,10 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/letsencrypt/boulder/identifier"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+
+	"github.com/letsencrypt/boulder/identifier"
 )
 
 // ErrorType provides a coarse category for BoulderErrors.
@@ -49,8 +50,13 @@ const (
 	AlreadyRevoked
 	BadRevocationReason
 	UnsupportedContact
-	// The requesteed serial number does not exist in the `serials` table.
+	// The requested serial number does not exist in the `serials` table.
 	UnknownSerial
+	// The certificate being indicated for replacement already has a replacement
+	// order.
+	Conflict
+	// Defined in https://datatracker.ietf.org/doc/draft-aaron-acme-profiles/00/
+	InvalidProfile
 )
 
 func (ErrorType) Error() string {
@@ -144,8 +150,17 @@ func (be *BoulderError) WithSubErrors(subErrs []SubBoulderError) *BoulderError {
 	}
 }
 
-// New is a convenience function for creating a new BoulderError
-func New(errType ErrorType, msg string, args ...interface{}) error {
+// New is a convenience function for creating a new BoulderError.
+func New(errType ErrorType, msg string) error {
+	return &BoulderError{
+		Type:   errType,
+		Detail: msg,
+	}
+}
+
+// newf is a convenience function for creating a new BoulderError with a
+// formatted message.
+func newf(errType ErrorType, msg string, args ...interface{}) error {
 	return &BoulderError{
 		Type:   errType,
 		Detail: fmt.Sprintf(msg, args...),
@@ -153,19 +168,19 @@ func New(errType ErrorType, msg string, args ...interface{}) error {
 }
 
 func InternalServerError(msg string, args ...interface{}) error {
-	return New(InternalServer, msg, args...)
+	return newf(InternalServer, msg, args...)
 }
 
 func MalformedError(msg string, args ...interface{}) error {
-	return New(Malformed, msg, args...)
+	return newf(Malformed, msg, args...)
 }
 
 func UnauthorizedError(msg string, args ...interface{}) error {
-	return New(Unauthorized, msg, args...)
+	return newf(Unauthorized, msg, args...)
 }
 
 func NotFoundError(msg string, args ...interface{}) error {
-	return New(NotFound, msg, args...)
+	return newf(NotFound, msg, args...)
 }
 
 func RateLimitError(retryAfter time.Duration, msg string, args ...interface{}) error {
@@ -176,82 +191,114 @@ func RateLimitError(retryAfter time.Duration, msg string, args ...interface{}) e
 	}
 }
 
-func DuplicateCertificateError(retryAfter time.Duration, msg string, args ...interface{}) error {
+func RegistrationsPerIPAddressError(retryAfter time.Duration, msg string, args ...interface{}) error {
 	return &BoulderError{
 		Type:       RateLimit,
-		Detail:     fmt.Sprintf(msg+": see https://letsencrypt.org/docs/duplicate-certificate-limit/", args...),
+		Detail:     fmt.Sprintf(msg+": see https://letsencrypt.org/docs/rate-limits/#new-registrations-per-ip-address", args...),
 		RetryAfter: retryAfter,
 	}
 }
 
-func FailedValidationError(retryAfter time.Duration, msg string, args ...interface{}) error {
+func RegistrationsPerIPv6RangeError(retryAfter time.Duration, msg string, args ...interface{}) error {
 	return &BoulderError{
 		Type:       RateLimit,
-		Detail:     fmt.Sprintf(msg+": see https://letsencrypt.org/docs/failed-validation-limit/", args...),
+		Detail:     fmt.Sprintf(msg+": see https://letsencrypt.org/docs/rate-limits/#new-registrations-per-ipv6-range", args...),
 		RetryAfter: retryAfter,
 	}
 }
 
-func RegistrationsPerIPError(retryAfter time.Duration, msg string, args ...interface{}) error {
+func NewOrdersPerAccountError(retryAfter time.Duration, msg string, args ...interface{}) error {
 	return &BoulderError{
 		Type:       RateLimit,
-		Detail:     fmt.Sprintf(msg+": see https://letsencrypt.org/docs/too-many-registrations-for-this-ip/", args...),
+		Detail:     fmt.Sprintf(msg+": see https://letsencrypt.org/docs/rate-limits/#new-orders-per-account", args...),
+		RetryAfter: retryAfter,
+	}
+}
+
+func CertificatesPerDomainError(retryAfter time.Duration, msg string, args ...interface{}) error {
+	return &BoulderError{
+		Type:       RateLimit,
+		Detail:     fmt.Sprintf(msg+": see https://letsencrypt.org/docs/rate-limits/#new-certificates-per-registered-domain", args...),
+		RetryAfter: retryAfter,
+	}
+}
+
+func CertificatesPerFQDNSetError(retryAfter time.Duration, msg string, args ...interface{}) error {
+	return &BoulderError{
+		Type:       RateLimit,
+		Detail:     fmt.Sprintf(msg+": see https://letsencrypt.org/docs/rate-limits/#new-certificates-per-exact-set-of-hostnames", args...),
+		RetryAfter: retryAfter,
+	}
+}
+
+func FailedAuthorizationsPerDomainPerAccountError(retryAfter time.Duration, msg string, args ...interface{}) error {
+	return &BoulderError{
+		Type:       RateLimit,
+		Detail:     fmt.Sprintf(msg+": see https://letsencrypt.org/docs/rate-limits/#authorization-failures-per-hostname-per-account", args...),
 		RetryAfter: retryAfter,
 	}
 }
 
 func RejectedIdentifierError(msg string, args ...interface{}) error {
-	return New(RejectedIdentifier, msg, args...)
+	return newf(RejectedIdentifier, msg, args...)
 }
 
 func InvalidEmailError(msg string, args ...interface{}) error {
-	return New(InvalidEmail, msg, args...)
+	return newf(InvalidEmail, msg, args...)
 }
 
 func UnsupportedContactError(msg string, args ...interface{}) error {
-	return New(UnsupportedContact, msg, args...)
+	return newf(UnsupportedContact, msg, args...)
 }
 
 func ConnectionFailureError(msg string, args ...interface{}) error {
-	return New(ConnectionFailure, msg, args...)
+	return newf(ConnectionFailure, msg, args...)
 }
 
 func CAAError(msg string, args ...interface{}) error {
-	return New(CAA, msg, args...)
+	return newf(CAA, msg, args...)
 }
 
 func MissingSCTsError(msg string, args ...interface{}) error {
-	return New(MissingSCTs, msg, args...)
+	return newf(MissingSCTs, msg, args...)
 }
 
 func DuplicateError(msg string, args ...interface{}) error {
-	return New(Duplicate, msg, args...)
+	return newf(Duplicate, msg, args...)
 }
 
 func OrderNotReadyError(msg string, args ...interface{}) error {
-	return New(OrderNotReady, msg, args...)
+	return newf(OrderNotReady, msg, args...)
 }
 
 func DNSError(msg string, args ...interface{}) error {
-	return New(DNS, msg, args...)
+	return newf(DNS, msg, args...)
 }
 
 func BadPublicKeyError(msg string, args ...interface{}) error {
-	return New(BadPublicKey, msg, args...)
+	return newf(BadPublicKey, msg, args...)
 }
 
 func BadCSRError(msg string, args ...interface{}) error {
-	return New(BadCSR, msg, args...)
+	return newf(BadCSR, msg, args...)
 }
 
 func AlreadyRevokedError(msg string, args ...interface{}) error {
-	return New(AlreadyRevoked, msg, args...)
+	return newf(AlreadyRevoked, msg, args...)
 }
 
 func BadRevocationReasonError(reason int64) error {
-	return New(BadRevocationReason, "disallowed revocation reason: %d", reason)
+	return newf(BadRevocationReason, "disallowed revocation reason: %d", reason)
 }
 
 func UnknownSerialError() error {
-	return New(UnknownSerial, "unknown serial")
+	return newf(UnknownSerial, "unknown serial")
+}
+
+func ConflictError(msg string, args ...interface{}) error {
+	return newf(Conflict, msg, args...)
+}
+
+func InvalidProfileError(msg string, args ...interface{}) error {
+	return newf(InvalidProfile, msg, args...)
 }

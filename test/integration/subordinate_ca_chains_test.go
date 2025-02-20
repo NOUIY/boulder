@@ -6,7 +6,7 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
-	"os"
+	"strings"
 	"testing"
 
 	"github.com/letsencrypt/boulder/test"
@@ -14,10 +14,6 @@ import (
 
 func TestSubordinateCAChainsServedByWFE(t *testing.T) {
 	t.Parallel()
-
-	if os.Getenv("BOULDER_CONFIG_DIR") != "test/config-next" {
-		t.Skip("Skipping test in config")
-	}
 
 	client, err := makeClient("mailto:example@letsencrypt.org")
 	test.AssertNotError(t, err, "creating acme client")
@@ -36,10 +32,10 @@ func TestSubordinateCAChainsServedByWFE(t *testing.T) {
 	seenECDSACrossSignedIntermediate := false
 	for _, certUrl := range chains.certs {
 		for _, cert := range certUrl {
-			if cert.Subject.String() == "CN=CA intermediate (ECDSA) A,O=good guys,C=US" && cert.Issuer.String() == "CN=CA root (ECDSA),O=good guys,C=US" {
+			if strings.Contains(cert.Subject.CommonName, "int ecdsa") && cert.Issuer.CommonName == "root ecdsa" {
 				seenECDSAIntermediate = true
 			}
-			if cert.Subject.String() == "CN=CA intermediate (ECDSA) A,O=good guys,C=US" && cert.Issuer.String() == "CN=CA root (RSA),O=good guys,C=US" {
+			if strings.Contains(cert.Subject.CommonName, "int ecdsa") && cert.Issuer.CommonName == "root rsa" {
 				seenECDSACrossSignedIntermediate = true
 			}
 		}

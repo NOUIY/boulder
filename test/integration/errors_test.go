@@ -18,17 +18,17 @@ func TestTooBigOrderError(t *testing.T) {
 	t.Parallel()
 
 	var domains []string
-	for i := 0; i < 101; i++ {
+	for i := range 101 {
 		domains = append(domains, fmt.Sprintf("%d.example.com", i))
 	}
 
-	_, err := authAndIssue(nil, nil, domains, true)
+	_, err := authAndIssue(nil, nil, domains, true, "")
 	test.AssertError(t, err, "authAndIssue failed")
 
 	var prob acme.Problem
 	test.AssertErrorWraps(t, err, &prob)
 	test.AssertEquals(t, prob.Type, "urn:ietf:params:acme:error:malformed")
-	test.AssertEquals(t, prob.Detail, "Error creating new order :: Order cannot contain more than 100 DNS names")
+	test.AssertEquals(t, prob.Detail, "Order cannot contain more than 100 DNS names")
 }
 
 // TestAccountEmailError tests that registering a new account, or updating an
@@ -42,13 +42,13 @@ func TestAccountEmailError(t *testing.T) {
 	// encoded JSON. The correct size to hit our maximum DB field length.
 	var longStringBuf strings.Builder
 	longStringBuf.WriteString("mailto:")
-	for i := 0; i < 175; i++ {
+	for range 175 {
 		longStringBuf.WriteRune('a')
 	}
 	longStringBuf.WriteString("@a.com")
 
 	createErrorPrefix := "Error creating new account :: "
-	updateErrorPrefix := "Unable to update account :: "
+	updateErrorPrefix := "Unable to update account :: invalid contact: "
 
 	testCases := []struct {
 		name               string
@@ -66,19 +66,19 @@ func TestAccountEmailError(t *testing.T) {
 			name:               "empty proto",
 			contacts:           []string{"mailto:valid@valid.com", " "},
 			expectedProbType:   "urn:ietf:params:acme:error:unsupportedContact",
-			expectedProbDetail: `contact method "" is not supported`,
+			expectedProbDetail: `only contact scheme 'mailto:' is supported`,
 		},
 		{
 			name:               "empty mailto",
 			contacts:           []string{"mailto:valid@valid.com", "mailto:"},
 			expectedProbType:   "urn:ietf:params:acme:error:invalidContact",
-			expectedProbDetail: `"" is not a valid e-mail address`,
+			expectedProbDetail: `unable to parse email address`,
 		},
 		{
 			name:               "non-ascii mailto",
 			contacts:           []string{"mailto:valid@valid.com", "mailto:cpu@l̴etsencrypt.org"},
 			expectedProbType:   "urn:ietf:params:acme:error:invalidContact",
-			expectedProbDetail: `contact email ["mailto:cpu@l̴etsencrypt.org"] contains non-ASCII characters`,
+			expectedProbDetail: `contact email contains non-ASCII characters`,
 		},
 		{
 			name:               "too many contacts",
@@ -90,25 +90,25 @@ func TestAccountEmailError(t *testing.T) {
 			name:               "invalid contact",
 			contacts:           []string{"mailto:valid@valid.com", "mailto:a@"},
 			expectedProbType:   "urn:ietf:params:acme:error:invalidContact",
-			expectedProbDetail: `"a@" is not a valid e-mail address`,
+			expectedProbDetail: `unable to parse email address`,
 		},
 		{
 			name:               "forbidden contact domain",
 			contacts:           []string{"mailto:valid@valid.com", "mailto:a@example.com"},
 			expectedProbType:   "urn:ietf:params:acme:error:invalidContact",
-			expectedProbDetail: "invalid contact domain. Contact emails @example.com are forbidden",
+			expectedProbDetail: "contact email has forbidden domain \"example.com\"",
 		},
 		{
 			name:               "contact domain invalid TLD",
 			contacts:           []string{"mailto:valid@valid.com", "mailto:a@example.cpu"},
 			expectedProbType:   "urn:ietf:params:acme:error:invalidContact",
-			expectedProbDetail: `contact email "a@example.cpu" has invalid domain : Domain name does not end with a valid public suffix (TLD)`,
+			expectedProbDetail: `contact email has invalid domain: Domain name does not end with a valid public suffix (TLD)`,
 		},
 		{
 			name:               "contact domain invalid",
 			contacts:           []string{"mailto:valid@valid.com", "mailto:a@example./.com"},
 			expectedProbType:   "urn:ietf:params:acme:error:invalidContact",
-			expectedProbDetail: "contact email \"a@example./.com\" has invalid domain : Domain name contains an invalid character",
+			expectedProbDetail: "contact email has invalid domain: Domain name contains an invalid character",
 		},
 		{
 			name: "too long contact",
@@ -124,11 +124,12 @@ func TestAccountEmailError(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			// First try registering a new account and ensuring the expected problem occurs
 			var prob acme.Problem
-			if _, err := makeClient(tc.contacts...); err != nil {
+			_, err := makeClient(tc.contacts...)
+			if err != nil {
 				test.AssertErrorWraps(t, err, &prob)
 				test.AssertEquals(t, prob.Type, tc.expectedProbType)
 				test.AssertEquals(t, prob.Detail, createErrorPrefix+tc.expectedProbDetail)
-			} else if err == nil {
+			} else {
 				t.Errorf("expected %s type problem for %q, got nil",
 					tc.expectedProbType, strings.Join(tc.contacts, ","))
 			}
@@ -137,11 +138,12 @@ func TestAccountEmailError(t *testing.T) {
 			// case contact info. The same problem should occur.
 			c, err := makeClient("mailto:valid@valid.com")
 			test.AssertNotError(t, err, "failed to create account with valid contact")
-			if _, err := c.UpdateAccount(c.Account, tc.contacts...); err != nil {
+			_, err = c.UpdateAccount(c.Account, tc.contacts...)
+			if err != nil {
 				test.AssertErrorWraps(t, err, &prob)
 				test.AssertEquals(t, prob.Type, tc.expectedProbType)
 				test.AssertEquals(t, prob.Detail, updateErrorPrefix+tc.expectedProbDetail)
-			} else if err == nil {
+			} else {
 				t.Errorf("expected %s type problem after updating account to %q, got nil",
 					tc.expectedProbType, strings.Join(tc.contacts, ","))
 			}
@@ -156,7 +158,7 @@ func TestRejectedIdentifier(t *testing.T) {
 	domains := []string{
 		"яџ–Х6яяdь}",
 	}
-	_, err := authAndIssue(nil, nil, domains, true)
+	_, err := authAndIssue(nil, nil, domains, true, "")
 	test.AssertError(t, err, "issuance should fail for one malformed name")
 	var prob acme.Problem
 	test.AssertErrorWraps(t, err, &prob)
@@ -174,7 +176,7 @@ func TestRejectedIdentifier(t *testing.T) {
 		"яџ–Х6яя",
 		"яџ–Х6яя`ь",
 	}
-	_, err = authAndIssue(nil, nil, domains, true)
+	_, err = authAndIssue(nil, nil, domains, true, "")
 	test.AssertError(t, err, "issuance should fail for multiple malformed names")
 	test.AssertErrorWraps(t, err, &prob)
 	test.AssertEquals(t, prob.Type, "urn:ietf:params:acme:error:rejectedIdentifier")

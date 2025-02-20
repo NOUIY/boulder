@@ -33,10 +33,6 @@ import (
 	"github.com/letsencrypt/boulder/test"
 )
 
-func TestImplementation(t *testing.T) {
-	test.AssertImplementsGRPCServer(t, &Impl{}, pubpb.UnimplementedPublisherServer{})
-}
-
 var log = blog.UseMock()
 var ctx = context.Background()
 
@@ -273,7 +269,7 @@ func TestTimestampVerificationPast(t *testing.T) {
 
 func TestLogCache(t *testing.T) {
 	cache := logCache{
-		logs: make(map[string]*Log),
+		logs: make(map[cacheKey]*Log),
 	}
 
 	// Adding a log with an invalid base64 public key should error

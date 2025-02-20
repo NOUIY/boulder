@@ -27,7 +27,7 @@ jobs:
   #  tags and 5 tests there would be 10 jobs run.
   b:
     # The type of runner that the job will run on
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-24.04
 
     strategy:
       # When set to true, GitHub cancels all in-progress jobs if any matrix job fails. Default: true
@@ -36,13 +36,13 @@ jobs:
       matrix:
         # Add additional docker image tags here and all tests will be run with the additional image.
         BOULDER_TOOLS_TAG:
-          - go1.21.8_2024-03-05
-          - go1.22.1_2024-03-05
+          - go1.23.6_2025-02-11
+          - go1.24.0_2025-02-11
         # Tests command definitions. Use the entire "docker compose" command you want to run.
         tests:
           # Run ./test.sh --help for a description of each of the flags.
           - "./t.sh --lints --generate"
-          - "./t.sh --integration && ./test/test-caa-log-checker.sh"
+          - "./t.sh --integration"
           # Testing Config Changes:
           # Config changes that have landed in main but not yet been applied to
           # production can be made in `test/config-next/<component>.json`.
@@ -72,7 +72,7 @@ jobs:
       - name: Docker Login
         # You may pin to the exact commit or the version.
         # uses: docker/login-action@f3364599c6aa293cdc2b8391b1b56d0c30e45c8a
-        uses: docker/login-action@v3.0.0
+        uses: docker/login-action@v3.3.0
         with:
           # Username used to log against the Docker registry
           username: ${{ secrets.DOCKER_USERNAME}}
@@ -91,20 +91,14 @@ jobs:
       - name: docker compose pull
         run: docker compose pull
 
-      # Enable https://github.com/golang/go/wiki/LoopvarExperiment
-      - run: echo "GOEXPERIMENT=loopvar" >> "$GITHUB_ENV"
-
       # Run the test matrix. This will run
       - name: "Run Test: ${{ matrix.tests }}"
         run: ${{ matrix.tests }}
 
   govulncheck:
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-24.04
     strategy:
-      # When set to true, GitHub cancels all in-progress jobs if any matrix job fails. Default: true
       fail-fast: false
-      matrix:
-        go-version: [ '1.21.8' ]
 
     steps:
       # Checks out your repository under $GITHUB_WORKSPACE, so your job can access it
@@ -112,21 +106,24 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Setup Go ${{ matrix.go-version }}
+      - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version: ${{ matrix.go-version }}
+          # When Go produces a security release, we want govulncheck to run
+          # against the most recently released Go version.
+          check-latest: true
+          go-version: "stable"
 
       - name: Run govulncheck
         run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
 
   vendorcheck:
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-24.04
     strategy:
       # When set to true, GitHub cancels all in-progress jobs if any matrix job fails. Default: true
       fail-fast: false
       matrix:
-        go-version: [ '1.21.5' ]
+        go-version: [ '1.22.5' ]
 
     steps:
       # Checks out your repository under $GITHUB_WORKSPACE, so your job can access it
@@ -157,7 +154,7 @@ jobs:
     permissions:
       contents: none
     if: ${{ always() }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     name: Boulder CI Test Matrix
     needs:
       - b

@@ -5,7 +5,6 @@ import (
 	"os"
 	"strings"
 
-	_ "github.com/letsencrypt/boulder/cmd/admin-revoker"
 	_ "github.com/letsencrypt/boulder/cmd/akamai-purger"
 	_ "github.com/letsencrypt/boulder/cmd/bad-key-revoker"
 	_ "github.com/letsencrypt/boulder/cmd/boulder-ca"
@@ -15,7 +14,6 @@ import (
 	_ "github.com/letsencrypt/boulder/cmd/boulder-sa"
 	_ "github.com/letsencrypt/boulder/cmd/boulder-va"
 	_ "github.com/letsencrypt/boulder/cmd/boulder-wfe2"
-	_ "github.com/letsencrypt/boulder/cmd/caa-log-checker"
 	_ "github.com/letsencrypt/boulder/cmd/cert-checker"
 	_ "github.com/letsencrypt/boulder/cmd/contact-auditor"
 	_ "github.com/letsencrypt/boulder/cmd/crl-checker"
@@ -27,8 +25,10 @@ import (
 	_ "github.com/letsencrypt/boulder/cmd/nonce-service"
 	_ "github.com/letsencrypt/boulder/cmd/notify-mailer"
 	_ "github.com/letsencrypt/boulder/cmd/ocsp-responder"
+	_ "github.com/letsencrypt/boulder/cmd/remoteva"
 	_ "github.com/letsencrypt/boulder/cmd/reversed-hostname-checker"
 	_ "github.com/letsencrypt/boulder/cmd/rocsp-tool"
+	_ "github.com/letsencrypt/boulder/cmd/sfe"
 	"github.com/letsencrypt/boulder/core"
 
 	"github.com/letsencrypt/boulder/cmd"
@@ -57,7 +57,7 @@ func readAndValidateConfigFile(name, filename string) error {
 // getConfigPath returns the path to the config file if it was provided as a
 // command line flag. If the flag was not provided, it returns an empty string.
 func getConfigPath() string {
-	for i := 0; i < len(os.Args); i++ {
+	for i := range len(os.Args) {
 		arg := os.Args[i]
 		if arg == "--config" || arg == "-config" {
 			if i+1 < len(os.Args) {
@@ -84,36 +84,30 @@ var boulderUsage = fmt.Sprintf(`Usage: %s <subcommand> [flags]
 
 func main() {
 	defer cmd.AuditPanic()
-	var command string
-	if core.Command() == "boulder" {
-		// Operator passed the boulder component as a subcommand.
-		if len(os.Args) <= 1 {
-			// No arguments passed.
-			fmt.Fprint(os.Stderr, boulderUsage)
-			return
-		}
 
-		if os.Args[1] == "--help" || os.Args[1] == "-help" {
-			// Help flag passed.
-			fmt.Fprint(os.Stderr, boulderUsage)
-			return
-		}
-
-		if os.Args[1] == "--list" || os.Args[1] == "-list" {
-			// List flag passed.
-			for _, c := range cmd.AvailableCommands() {
-				fmt.Println(c)
-			}
-			return
-		}
-		command = os.Args[1]
-
-		// Remove the subcommand from the arguments.
-		os.Args = os.Args[1:]
-	} else {
-		// Operator ran a boulder component using a symlink.
-		command = core.Command()
+	if len(os.Args) <= 1 {
+		// No arguments passed.
+		fmt.Fprint(os.Stderr, boulderUsage)
+		return
 	}
+
+	if os.Args[1] == "--help" || os.Args[1] == "-help" {
+		// Help flag passed.
+		fmt.Fprint(os.Stderr, boulderUsage)
+		return
+	}
+
+	if os.Args[1] == "--list" || os.Args[1] == "-list" {
+		// List flag passed.
+		for _, c := range cmd.AvailableCommands() {
+			fmt.Println(c)
+		}
+		return
+	}
+
+	// Remove the subcommand from the arguments.
+	command := os.Args[1]
+	os.Args = os.Args[1:]
 
 	config := getConfigPath()
 	if config != "" {

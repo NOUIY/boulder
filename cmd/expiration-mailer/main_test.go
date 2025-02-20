@@ -9,13 +9,16 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
-	"net"
 	"strings"
 	"testing"
 	"text/template"
 	"time"
 
 	"github.com/jmhodges/clock"
+	"github.com/prometheus/client_golang/prometheus"
+	io_prometheus_client "github.com/prometheus/client_model/go"
+	"google.golang.org/grpc"
+
 	"github.com/letsencrypt/boulder/core"
 	corepb "github.com/letsencrypt/boulder/core/proto"
 	"github.com/letsencrypt/boulder/db"
@@ -30,9 +33,6 @@ import (
 	"github.com/letsencrypt/boulder/test"
 	isa "github.com/letsencrypt/boulder/test/inmem/sa"
 	"github.com/letsencrypt/boulder/test/vars"
-	"github.com/prometheus/client_golang/prometheus"
-	io_prometheus_client "github.com/prometheus/client_model/go"
-	"google.golang.org/grpc"
 )
 
 type fakeRegStore struct {
@@ -100,7 +100,7 @@ func TestSendNagsManyCerts(t *testing.T) {
 	}
 
 	var certs []*x509.Certificate
-	for i := 0; i < 101; i++ {
+	for i := range 101 {
 		certs = append(certs, &x509.Certificate{
 			SerialNumber: big.NewInt(0x0304),
 			NotAfter:     fc.Now().AddDate(0, 0, 2),
@@ -180,12 +180,9 @@ func TestSendNags(t *testing.T) {
 	test.AssertErrorIs(t, err, errNoValidEmail)
 	test.AssertEquals(t, len(mc.Messages), 0)
 
-	sendLogs := log.GetAllMatching("INFO: attempting send JSON=.*")
+	sendLogs := log.GetAllMatching("INFO: attempting send for JSON=.*")
 	if len(sendLogs) != 2 {
 		t.Errorf("expected 2 'attempting send' log line, got %d: %s", len(sendLogs), strings.Join(sendLogs, "\n"))
-	}
-	if !strings.Contains(sendLogs[0], `"Rcpt":["rolandshoemaker@gmail.com"]`) {
-		t.Errorf("expected first 'attempting send' log line to have one address, got %q", sendLogs[0])
 	}
 	if !strings.Contains(sendLogs[0], `"TruncatedSerials":["000000000000000000000000000000000304"]`) {
 		t.Errorf("expected first 'attempting send' log line to have one serial, got %q", sendLogs[0])
@@ -195,6 +192,9 @@ func TestSendNags(t *testing.T) {
 	}
 	if !strings.Contains(sendLogs[0], `"TruncatedDNSNames":["example.com"]`) {
 		t.Errorf("expected first 'attempting send' log line to have 1 domain, 'example.com', got %q", sendLogs[0])
+	}
+	if strings.Contains(sendLogs[0], `"@gmail.com"`) {
+		t.Errorf("log line should not contain email address, got %q", sendLogs[0])
 	}
 }
 
@@ -461,20 +461,10 @@ func TestFindExpiringCertificates(t *testing.T) {
 }
 
 func makeRegistration(sac sapb.StorageAuthorityClient, id int64, jsonKey []byte, contacts []string) (*corepb.Registration, error) {
-	var ip [4]byte
-	_, err := rand.Reader.Read(ip[:])
-	if err != nil {
-		return nil, err
-	}
-	ipText, err := net.IP(ip[:]).MarshalText()
-	if err != nil {
-		return nil, fmt.Errorf("formatting IP address: %s", err)
-	}
 	reg, err := sac.NewRegistration(context.Background(), &corepb.Registration{
-		Id:        id,
-		Contact:   contacts,
-		Key:       jsonKey,
-		InitialIP: ipText,
+		Id:      id,
+		Contact: contacts,
+		Key:     jsonKey,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("storing registration: %s", err)

@@ -58,17 +58,9 @@ type Executor interface {
 	OneSelector
 	Inserter
 	SelectExecer
-	Queryer
 	Delete(context.Context, ...interface{}) (int64, error)
 	Get(context.Context, interface{}, ...interface{}) (interface{}, error)
 	Update(context.Context, ...interface{}) (int64, error)
-}
-
-// Queryer offers the QueryContext method. Note that this is not read-only (i.e. not
-// Selector), since a QueryContext can be `INSERT`, `UPDATE`, etc. The difference
-// between QueryContext and ExecContext is that QueryContext can return rows. So for instance it is
-// suitable for inserting rows and getting back ids.
-type Queryer interface {
 	QueryContext(context.Context, string, ...interface{}) (*sql.Rows, error)
 }
 
@@ -95,6 +87,7 @@ type MappedSelector[T any] interface {
 // Rows is anything which lets you iterate over the result rows of a SELECT
 // query. It is similar to sql.Rows, but generic.
 type Rows[T any] interface {
+	ForEach(func(*T) error) error
 	Next() bool
 	Get() (*T, error)
 	Err() error

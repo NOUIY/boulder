@@ -2,26 +2,25 @@ package sa
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/rand"
-	"crypto/rsa"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"database/sql"
-	"encoding/base64"
 	"fmt"
 	"math/big"
-	"net"
 	"os"
 	"testing"
 	"time"
 
 	"github.com/jmhodges/clock"
+	"google.golang.org/protobuf/types/known/timestamppb"
+
 	"github.com/letsencrypt/boulder/db"
-	"github.com/letsencrypt/boulder/features"
 	"github.com/letsencrypt/boulder/grpc"
 	"github.com/letsencrypt/boulder/probs"
 	"github.com/letsencrypt/boulder/test/vars"
-	"google.golang.org/protobuf/types/known/timestamppb"
 
 	"github.com/letsencrypt/boulder/core"
 	corepb "github.com/letsencrypt/boulder/core/proto"
@@ -35,19 +34,11 @@ func TestRegistrationModelToPb(t *testing.T) {
 	}{
 		{
 			name:  "No ID",
-			input: regModel{ID: 0, Key: []byte("foo"), InitialIP: []byte("foo")},
+			input: regModel{ID: 0, Key: []byte("foo")},
 		},
 		{
 			name:  "No Key",
-			input: regModel{ID: 1, Key: nil, InitialIP: []byte("foo")},
-		},
-		{
-			name:  "No IP",
-			input: regModel{ID: 1, Key: []byte("foo"), InitialIP: nil},
-		},
-		{
-			name:  "Bad IP",
-			input: regModel{ID: 1, Key: []byte("foo"), InitialIP: []byte("foo")},
+			input: regModel{ID: 1, Key: nil},
 		},
 	}
 	for _, tc := range badCases {
@@ -57,9 +48,7 @@ func TestRegistrationModelToPb(t *testing.T) {
 		})
 	}
 
-	_, err := registrationModelToPb(&regModel{
-		ID: 1, Key: []byte("foo"), InitialIP: net.ParseIP("1.2.3.4"),
-	})
+	_, err := registrationModelToPb(&regModel{ID: 1, Key: []byte("foo")})
 	test.AssertNotError(t, err, "Should pass")
 }
 
@@ -70,11 +59,12 @@ func TestAuthzModel(t *testing.T) {
 	now := clk.Now()
 	expires := now.Add(24 * time.Hour)
 	authzPB := &corepb.Authorization{
-		Id:             "1",
-		Identifier:     "example.com",
-		RegistrationID: 1,
-		Status:         string(core.StatusValid),
-		Expires:        timestamppb.New(expires),
+		Id:                     "1",
+		DnsName:                "example.com",
+		RegistrationID:         1,
+		Status:                 string(core.StatusValid),
+		Expires:                timestamppb.New(expires),
+		CertificateProfileName: "test",
 		Challenges: []*corepb.Challenge{
 			{
 				Type:      string(core.ChallengeTypeHTTP01),
@@ -112,12 +102,13 @@ func TestAuthzModel(t *testing.T) {
 	authzPB.Challenges[0].Validationrecords[0].Hostname = "example.com"
 	authzPB.Challenges[0].Validationrecords[0].Port = "443"
 	test.AssertDeepEquals(t, authzPB.Challenges, authzPBOut.Challenges)
+	test.AssertEquals(t, authzPBOut.CertificateProfileName, authzPB.CertificateProfileName)
 
 	now = clk.Now()
 	expires = now.Add(24 * time.Hour)
 	authzPB = &corepb.Authorization{
 		Id:             "1",
-		Identifier:     "example.com",
+		DnsName:        "example.com",
 		RegistrationID: 1,
 		Status:         string(core.StatusValid),
 		Expires:        timestamppb.New(expires),
@@ -168,7 +159,7 @@ func TestAuthzModel(t *testing.T) {
 	expires = now.Add(24 * time.Hour)
 	authzPB = &corepb.Authorization{
 		Id:             "1",
-		Identifier:     "example.com",
+		DnsName:        "example.com",
 		RegistrationID: 1,
 		Status:         string(core.StatusInvalid),
 		Expires:        timestamppb.New(expires),
@@ -209,7 +200,7 @@ func TestAuthzModel(t *testing.T) {
 	expires = now.Add(24 * time.Hour)
 	authzPB = &corepb.Authorization{
 		Id:             "1",
-		Identifier:     "example.com",
+		DnsName:        "example.com",
 		RegistrationID: 1,
 		Status:         string(core.StatusValid),
 		Expires:        timestamppb.New(expires),
@@ -251,10 +242,30 @@ func TestModelToOrderBadJSON(t *testing.T) {
 	_, err := modelToOrder(&orderModel{
 		Error: badJSON,
 	})
-	test.AssertError(t, err, "expected error from modelToOrder")
+	test.AssertError(t, err, "expected error from modelToOrderv2")
 	var badJSONErr errBadJSON
 	test.AssertErrorWraps(t, err, &badJSONErr)
 	test.AssertEquals(t, string(badJSONErr.json), string(badJSON))
+}
+
+func TestOrderModelThereAndBackAgain(t *testing.T) {
+	clk := clock.New()
+	now := clk.Now()
+	order := &corepb.Order{
+		Id:                     1,
+		RegistrationID:         2024,
+		Expires:                timestamppb.New(now.Add(24 * time.Hour)),
+		Created:                timestamppb.New(now),
+		Error:                  nil,
+		CertificateSerial:      "2",
+		BeganProcessing:        true,
+		CertificateProfileName: "phljny",
+	}
+	model, err := orderToModel(order)
+	test.AssertNotError(t, err, "orderToModelv2 should not have errored")
+	returnOrder, err := modelToOrder(model)
+	test.AssertNotError(t, err, "modelToOrderv2 should not have errored")
+	test.AssertDeepEquals(t, order, returnOrder)
 }
 
 // TestPopulateAttemptedFieldsBadJSON tests that populating a challenge from an
@@ -333,35 +344,25 @@ func insertCertificate(ctx context.Context, dbMap *db.WrappedMap, fc clock.FakeC
 		SerialNumber: serialBigInt,
 	}
 
-	testKey := makeKey()
-	certDer, _ := x509.CreateCertificate(rand.Reader, &template, &template, &testKey.PublicKey, &testKey)
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return fmt.Errorf("generating test key: %w", err)
+	}
+	certDer, err := x509.CreateCertificate(rand.Reader, &template, &template, key.Public(), key)
+	if err != nil {
+		return fmt.Errorf("generating test cert: %w", err)
+	}
 	cert := &core.Certificate{
 		RegistrationID: regID,
 		Serial:         serialString,
 		Expires:        template.NotAfter,
 		DER:            certDer,
 	}
-	err := dbMap.Insert(ctx, cert)
+	err = dbMap.Insert(ctx, cert)
 	if err != nil {
 		return err
 	}
 	return nil
-}
-
-func bigIntFromB64(b64 string) *big.Int {
-	bytes, _ := base64.URLEncoding.DecodeString(b64)
-	x := big.NewInt(0)
-	x.SetBytes(bytes)
-	return x
-}
-
-func makeKey() rsa.PrivateKey {
-	n := bigIntFromB64("n4EPtAOCc9AlkeQHPzHStgAbgs7bTZLwUBZdR8_KuKPEHLd4rHVTeT-O-XV2jRojdNhxJWTDvNd7nqQ0VEiZQHz_AJmSCpMaJMRBSFKrKb2wqVwGU_NsYOYL-QtiWN2lbzcEe6XC0dApr5ydQLrHqkHHig3RBordaZ6Aj-oBHqFEHYpPe7Tpe-OfVfHd1E6cS6M1FZcD1NNLYD5lFHpPI9bTwJlsde3uhGqC0ZCuEHg8lhzwOHrtIQbS0FVbb9k3-tVTU4fg_3L_vniUFAKwuCLqKnS2BYwdq_mzSnbLY7h_qixoR7jig3__kRhuaxwUkRz5iaiQkqgc5gHdrNP5zw==")
-	e := int(bigIntFromB64("AQAB").Int64())
-	d := bigIntFromB64("bWUC9B-EFRIo8kpGfh0ZuyGPvMNKvYWNtB_ikiH9k20eT-O1q_I78eiZkpXxXQ0UTEs2LsNRS-8uJbvQ-A1irkwMSMkK1J3XTGgdrhCku9gRldY7sNA_AKZGh-Q661_42rINLRCe8W-nZ34ui_qOfkLnK9QWDDqpaIsA-bMwWWSDFu2MUBYwkHTMEzLYGqOe04noqeq1hExBTHBOBdkMXiuFhUq1BU6l-DqEiWxqg82sXt2h-LMnT3046AOYJoRioz75tSUQfGCshWTBnP5uDjd18kKhyv07lhfSJdrPdM5Plyl21hsFf4L_mHCuoFau7gdsPfHPxxjVOcOpBrQzwQ==")
-	p := bigIntFromB64("uKE2dh-cTf6ERF4k4e_jy78GfPYUIaUyoSSJuBzp3Cubk3OCqs6grT8bR_cu0Dm1MZwWmtdqDyI95HrUeq3MP15vMMON8lHTeZu2lmKvwqW7anV5UzhM1iZ7z4yMkuUwFWoBvyY898EXvRD-hdqRxHlSqAZ192zB3pVFJ0s7pFc=")
-	q := bigIntFromB64("uKE2dh-cTf6ERF4k4e_jy78GfPYUIaUyoSSJuBzp3Cubk3OCqs6grT8bR_cu0Dm1MZwWmtdqDyI95HrUeq3MP15vMMON8lHTeZu2lmKvwqW7anV5UzhM1iZ7z4yMkuUwFWoBvyY898EXvRD-hdqRxHlSqAZ192zB3pVFJ0s7pFc=")
-	return rsa.PrivateKey{PublicKey: rsa.PublicKey{N: n, E: e}, D: d, Primes: []*big.Int{p, q}}
 }
 
 func TestIncidentSerialModel(t *testing.T) {
@@ -425,9 +426,6 @@ func TestAddReplacementOrder(t *testing.T) {
 	sa, _, cleanUp := initSA(t)
 	defer cleanUp()
 
-	features.Set(features.Config{TrackReplacementCertificatesARI: true})
-	defer features.Reset()
-
 	oldCertSerial := "1234567890"
 	orderId := int64(1337)
 	orderExpires := time.Now().Add(24 * time.Hour).UTC().Truncate(time.Second)
@@ -476,9 +474,6 @@ func TestSetReplacementOrderFinalized(t *testing.T) {
 
 	sa, _, cleanUp := initSA(t)
 	defer cleanUp()
-
-	features.Set(features.Config{TrackReplacementCertificatesARI: true})
-	defer features.Reset()
 
 	oldCertSerial := "1234567890"
 	orderId := int64(1337)

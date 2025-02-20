@@ -15,24 +15,28 @@ jobs:
       fail-fast: false
       matrix:
         GO_VERSION:
-          - "1.21.8"
-          - "1.22.1"
+          - "1.23.6"
+          - "1.24.0"
     runs-on: ubuntu-20.04
     permissions:
       contents: write
+      packages: write
     steps:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
-
-      # Enable https://github.com/golang/go/wiki/LoopvarExperiment
-      - run: echo "GOEXPERIMENT=loopvar" >> "$GITHUB_ENV"
 
       - name: Build .deb
         id: build
         env:
           GO_VERSION: ${{ matrix.GO_VERSION }}
         run: ./tools/make-assets.sh
+
+      - name: Compute checksums
+        id: checksums
+        # The files listed on this line must be identical to the files uploaded
+        # in the last step.
+        run: sha256sum boulder*.deb boulder*.tar.gz >| boulder-${{ matrix.GO_VERSION }}.$(date +%s)-$(git rev-parse --short=8 HEAD).checksums.txt
 
       - name: Create release
         env:
@@ -45,4 +49,15 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         # https://cli.github.com/manual/gh_release_upload
-        run: gh release upload "${GITHUB_REF_NAME}" boulder*.deb boulder*.tar.gz
+        run: gh release upload "${GITHUB_REF_NAME}" boulder*.deb boulder*.tar.gz boulder*.checksums.txt
+
+      - name: Build ct-test-srv Container
+        run: docker buildx build . --build-arg "GO_VERSION=${{ matrix.GO_VERSION }}" -f test/ct-test-srv/Dockerfile -t "ghcr.io/letsencrypt/ct-test-srv:${{ github.ref_name }}-go${{ matrix.GO_VERSION }}"
+
+      - name: Login to ghcr.io
+        run: printenv GITHUB_TOKEN | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push ct-test-srv Container
+        run: docker push "ghcr.io/letsencrypt/ct-test-srv:${{ github.ref_name }}-go${{ matrix.GO_VERSION }}"

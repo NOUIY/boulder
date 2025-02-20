@@ -57,9 +57,11 @@ type CRLRequest struct {
 	ThisUpdate time.Time
 
 	Entries []x509.RevocationListEntry
+}
 
-	// TODO(#7296): Remove this and instead compute it from Issuer.CRLBaseURL
-	DeprecatedIDPBaseURL string
+// crlURL combines the CRL URL base with a shard, and adds a suffix.
+func (i *Issuer) crlURL(shard int) string {
+	return fmt.Sprintf("%s%d.crl", i.crlURLBase, shard)
 }
 
 func (i *Issuer) IssueCRL(prof *CRLProfile, req *CRLRequest) ([]byte, error) {
@@ -78,20 +80,15 @@ func (i *Issuer) IssueCRL(prof *CRLProfile, req *CRLRequest) ([]byte, error) {
 		NextUpdate:                req.ThisUpdate.Add(-time.Second).Add(prof.validityInterval),
 	}
 
-	if i.crlURLBase == "" && req.DeprecatedIDPBaseURL == "" {
+	if i.crlURLBase == "" {
 		return nil, fmt.Errorf("CRL must contain an issuingDistributionPoint")
 	}
 
-	var idps []string
-	if i.crlURLBase != "" {
-		idps = append(idps, fmt.Sprintf("%s/%d.crl", i.crlURLBase, req.Shard))
-	}
-	if req.DeprecatedIDPBaseURL != "" {
-		// TODO(#7296): Remove this fallback once CCADB and all non-expired certs
-		// contain the new-style CRLDP URL instead.
-		idps = append(idps, fmt.Sprintf("%s/%d/%d.crl", req.DeprecatedIDPBaseURL, i.NameID(), req.Shard))
-	}
-	idp, err := idp.MakeUserCertsExt(idps)
+	// Concat the base with the shard directly, since we require that the base
+	// end with a single trailing slash.
+	idp, err := idp.MakeUserCertsExt([]string{
+		i.crlURL(int(req.Shard)),
+	})
 	if err != nil {
 		return nil, fmt.Errorf("creating IDP extension: %w", err)
 	}

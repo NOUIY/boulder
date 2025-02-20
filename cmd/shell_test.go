@@ -11,10 +11,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+
+	"github.com/letsencrypt/boulder/config"
 	"github.com/letsencrypt/boulder/core"
 	blog "github.com/letsencrypt/boulder/log"
 	"github.com/letsencrypt/boulder/test"
-	"github.com/prometheus/client_golang/prometheus"
 )
 
 var (
@@ -196,9 +198,11 @@ func loadConfigFile(t *testing.T, path string) *os.File {
 
 func TestFailedConfigValidation(t *testing.T) {
 	type FooConfig struct {
-		VitalValue       string `yaml:"vitalValue" validate:"required"`
-		VoluntarilyVoid  string `yaml:"voluntarilyVoid"`
-		VisciouslyVetted string `yaml:"visciouslyVetted" validate:"omitempty,endswith=baz"`
+		VitalValue       string          `yaml:"vitalValue" validate:"required"`
+		VoluntarilyVoid  string          `yaml:"voluntarilyVoid"`
+		VisciouslyVetted string          `yaml:"visciouslyVetted" validate:"omitempty,endswith=baz"`
+		VolatileVagary   config.Duration `yaml:"volatileVagary" validate:"required,lte=120s"`
+		VernalVeil       config.Duration `yaml:"vernalVeil" validate:"required"`
 	}
 
 	// Violates 'endswith' tag JSON.
@@ -228,6 +232,34 @@ func TestFailedConfigValidation(t *testing.T) {
 	err = ValidateYAMLConfig(&ConfigValidator{&FooConfig{}, nil}, cf)
 	test.AssertError(t, err, "Expected validation error")
 	test.AssertContains(t, err.Error(), "'required'")
+
+	// Violates 'lte' tag JSON for config.Duration type.
+	cf = loadConfigFile(t, "testdata/3_configDuration_too_darn_big.json")
+	defer cf.Close()
+	err = ValidateJSONConfig(&ConfigValidator{&FooConfig{}, nil}, cf)
+	test.AssertError(t, err, "Expected validation error")
+	test.AssertContains(t, err.Error(), "'lte'")
+
+	// Violates 'lte' tag JSON for config.Duration type.
+	cf = loadConfigFile(t, "testdata/3_configDuration_too_darn_big.json")
+	defer cf.Close()
+	err = ValidateJSONConfig(&ConfigValidator{&FooConfig{}, nil}, cf)
+	test.AssertError(t, err, "Expected validation error")
+	test.AssertContains(t, err.Error(), "'lte'")
+
+	// Incorrect value for the config.Duration type.
+	cf = loadConfigFile(t, "testdata/4_incorrect_data_for_type.json")
+	defer cf.Close()
+	err = ValidateJSONConfig(&ConfigValidator{&FooConfig{}, nil}, cf)
+	test.AssertError(t, err, "Expected error")
+	test.AssertContains(t, err.Error(), "missing unit in duration")
+
+	// Incorrect value for the config.Duration type.
+	cf = loadConfigFile(t, "testdata/4_incorrect_data_for_type.yaml")
+	defer cf.Close()
+	err = ValidateYAMLConfig(&ConfigValidator{&FooConfig{}, nil}, cf)
+	test.AssertError(t, err, "Expected error")
+	test.AssertContains(t, err.Error(), "missing unit in duration")
 }
 
 func TestFailExit(t *testing.T) {
@@ -241,9 +273,7 @@ func TestFailExit(t *testing.T) {
 		return
 	}
 
-	// gosec points out that os.Args[0] is tainted, but we only run this as a test
-	// so we are not worried about it containing an untrusted value.
-	//nolint:gosec
+	//nolint: gosec // Test-only code is not concerned about untrusted values in os.Args[0]
 	cmd := exec.Command(os.Args[0], "-test.run=TestFailExit")
 	cmd.Env = append(os.Environ(), "TIME_TO_DIE=1")
 	output, err := cmd.CombinedOutput()
@@ -256,7 +286,7 @@ func TestFailExit(t *testing.T) {
 
 func testPanicStackTraceHelper() {
 	var x *int
-	*x = 1 //nolint:govet
+	*x = 1 //nolint: govet // Purposeful nil pointer dereference to trigger a panic
 }
 
 func TestPanicStackTrace(t *testing.T) {
@@ -270,9 +300,7 @@ func TestPanicStackTrace(t *testing.T) {
 		return
 	}
 
-	// gosec points out that os.Args[0] is tainted, but we only run this as a test
-	// so we are not worried about it containing an untrusted value.
-	//nolint:gosec
+	//nolint: gosec // Test-only code is not concerned about untrusted values in os.Args[0]
 	cmd := exec.Command(os.Args[0], "-test.run=TestPanicStackTrace")
 	cmd.Env = append(os.Environ(), "AT_THE_DISCO=1")
 	output, err := cmd.CombinedOutput()

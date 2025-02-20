@@ -3,17 +3,11 @@
 package integration
 
 import (
-	"context"
-	"os"
-	"strings"
+	"crypto/rand"
+	"encoding/hex"
+	"fmt"
 	"testing"
 
-	"github.com/jmhodges/clock"
-	"github.com/letsencrypt/boulder/cmd"
-	blog "github.com/letsencrypt/boulder/log"
-	"github.com/letsencrypt/boulder/metrics"
-	"github.com/letsencrypt/boulder/ratelimits"
-	bredis "github.com/letsencrypt/boulder/redis"
 	"github.com/letsencrypt/boulder/test"
 )
 
@@ -21,53 +15,43 @@ func TestDuplicateFQDNRateLimit(t *testing.T) {
 	t.Parallel()
 	domain := random_domain()
 
-	_, err := authAndIssue(nil, nil, []string{domain}, true)
+	// The global rate limit for a duplicate certificates is 2 per 3 hours.
+	_, err := authAndIssue(nil, nil, []string{domain}, true, "")
 	test.AssertNotError(t, err, "Failed to issue first certificate")
 
-	_, err = authAndIssue(nil, nil, []string{domain}, true)
+	_, err = authAndIssue(nil, nil, []string{domain}, true, "")
 	test.AssertNotError(t, err, "Failed to issue second certificate")
 
-	_, err = authAndIssue(nil, nil, []string{domain}, true)
+	_, err = authAndIssue(nil, nil, []string{domain}, true, "")
 	test.AssertError(t, err, "Somehow managed to issue third certificate")
 
-	if strings.Contains(os.Getenv("BOULDER_CONFIG_DIR"), "test/config-next") {
-		// Setup rate limiting.
-		rc := bredis.Config{
-			Username: "unittest-rw",
-			TLS: cmd.TLSConfig{
-				CACertFile: "test/redis-tls/minica.pem",
-				CertFile:   "test/redis-tls/boulder/cert.pem",
-				KeyFile:    "test/redis-tls/boulder/key.pem",
-			},
-			Lookups: []cmd.ServiceDomain{
-				{
-					Service: "redisratelimits",
-					Domain:  "service.consul",
-				},
-			},
-			LookupDNSAuthority: "consul.service.consul",
-		}
-		rc.PasswordConfig = cmd.PasswordConfig{
-			PasswordFile: "test/secrets/ratelimits_redis_password",
-		}
+	test.AssertContains(t, err.Error(), "too many certificates (2) already issued for this exact set of domains in the last 3h0m0s")
+}
 
-		fc := clock.NewFake()
-		stats := metrics.NoopRegisterer
-		log := blog.NewMock()
-		ring, err := bredis.NewRingFromConfig(rc, stats, log)
-		test.AssertNotError(t, err, "making redis ring client")
-		source := ratelimits.NewRedisSource(ring.Ring, fc, stats)
-		test.AssertNotNil(t, source, "source should not be nil")
-		limiter, err := ratelimits.NewLimiter(fc, source, stats)
-		test.AssertNotError(t, err, "making limiter")
-		txnBuilder, err := ratelimits.NewTransactionBuilder("test/config-next/wfe2-ratelimit-defaults.yml", "")
-		test.AssertNotError(t, err, "making transaction composer")
+func TestCertificatesPerDomain(t *testing.T) {
+	t.Parallel()
 
-		// Check that the CertificatesPerFQDNSet limit is reached.
-		txn, err := txnBuilder.CertificatesPerFQDNSetTransaction([]string{domain})
-		test.AssertNotError(t, err, "making transaction")
-		result, err := limiter.Check(context.Background(), txn)
-		test.AssertNotError(t, err, "checking transaction")
-		test.Assert(t, !result.Allowed, "should not be allowed")
+	randomDomain := random_domain()
+	randomSubDomain := func() string {
+		var bytes [3]byte
+		rand.Read(bytes[:])
+		return fmt.Sprintf("%s.%s", hex.EncodeToString(bytes[:]), randomDomain)
 	}
+
+	firstSubDomain := randomSubDomain()
+	_, err := authAndIssue(nil, nil, []string{firstSubDomain}, true, "")
+	test.AssertNotError(t, err, "Failed to issue first certificate")
+
+	_, err = authAndIssue(nil, nil, []string{randomSubDomain()}, true, "")
+	test.AssertNotError(t, err, "Failed to issue second certificate")
+
+	_, err = authAndIssue(nil, nil, []string{randomSubDomain()}, true, "")
+	test.AssertError(t, err, "Somehow managed to issue third certificate")
+
+	test.AssertContains(t, err.Error(), fmt.Sprintf("too many certificates (2) already issued for %q in the last 2160h0m0s", randomDomain))
+
+	// Issue a certificate for the first subdomain, which should succeed because
+	// it's a renewal.
+	_, err = authAndIssue(nil, nil, []string{firstSubDomain}, true, "")
+	test.AssertNotError(t, err, "Failed to issue renewal certificate")
 }

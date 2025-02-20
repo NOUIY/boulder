@@ -20,11 +20,14 @@ const (
 	BadRevocationReasonProblem   = ProblemType("badRevocationReason")
 	BadSignatureAlgorithmProblem = ProblemType("badSignatureAlgorithm")
 	CAAProblem                   = ProblemType("caa")
+	// ConflictProblem is a problem type that is not defined in RFC8555.
+	ConflictProblem              = ProblemType("conflict")
 	ConnectionProblem            = ProblemType("connection")
 	DNSProblem                   = ProblemType("dns")
 	InvalidContactProblem        = ProblemType("invalidContact")
 	MalformedProblem             = ProblemType("malformed")
 	OrderNotReadyProblem         = ProblemType("orderNotReady")
+	PausedProblem                = ProblemType("rateLimited")
 	RateLimitedProblem           = ProblemType("rateLimited")
 	RejectedIdentifierProblem    = ProblemType("rejectedIdentifier")
 	ServerInternalProblem        = ProblemType("serverInternal")
@@ -32,6 +35,9 @@ const (
 	UnauthorizedProblem          = ProblemType("unauthorized")
 	UnsupportedContactProblem    = ProblemType("unsupportedContact")
 	UnsupportedIdentifierProblem = ProblemType("unsupportedIdentifier")
+
+	// Defined in https://datatracker.ietf.org/doc/draft-aaron-acme-profiles/
+	InvalidProfileProblem = ProblemType("invalidProfile")
 
 	ErrorNS = "urn:ietf:params:acme:error:"
 )
@@ -90,19 +96,19 @@ func AccountDoesNotExist(detail string) *ProblemDetails {
 
 // AlreadyRevoked returns a ProblemDetails with a AlreadyRevokedProblem and a 400 Bad
 // Request status code.
-func AlreadyRevoked(detail string, a ...any) *ProblemDetails {
+func AlreadyRevoked(detail string) *ProblemDetails {
 	return &ProblemDetails{
 		Type:       AlreadyRevokedProblem,
-		Detail:     fmt.Sprintf(detail, a...),
+		Detail:     detail,
 		HTTPStatus: http.StatusBadRequest,
 	}
 }
 
 // BadCSR returns a ProblemDetails representing a BadCSRProblem.
-func BadCSR(detail string, a ...any) *ProblemDetails {
+func BadCSR(detail string) *ProblemDetails {
 	return &ProblemDetails{
 		Type:       BadCSRProblem,
-		Detail:     fmt.Sprintf(detail, a...),
+		Detail:     detail,
 		HTTPStatus: http.StatusBadRequest,
 	}
 }
@@ -119,30 +125,30 @@ func BadNonce(detail string) *ProblemDetails {
 
 // BadPublicKey returns a ProblemDetails with a BadPublicKeyProblem and a 400 Bad
 // Request status code.
-func BadPublicKey(detail string, a ...any) *ProblemDetails {
+func BadPublicKey(detail string) *ProblemDetails {
 	return &ProblemDetails{
 		Type:       BadPublicKeyProblem,
-		Detail:     fmt.Sprintf(detail, a...),
+		Detail:     detail,
 		HTTPStatus: http.StatusBadRequest,
 	}
 }
 
 // BadRevocationReason returns a ProblemDetails representing
 // a BadRevocationReasonProblem
-func BadRevocationReason(detail string, a ...any) *ProblemDetails {
+func BadRevocationReason(detail string) *ProblemDetails {
 	return &ProblemDetails{
 		Type:       BadRevocationReasonProblem,
-		Detail:     fmt.Sprintf(detail, a...),
+		Detail:     detail,
 		HTTPStatus: http.StatusBadRequest,
 	}
 }
 
 // BadSignatureAlgorithm returns a ProblemDetails with a BadSignatureAlgorithmProblem
 // and a 400 Bad Request status code.
-func BadSignatureAlgorithm(detail string, a ...any) *ProblemDetails {
+func BadSignatureAlgorithm(detail string) *ProblemDetails {
 	return &ProblemDetails{
 		Type:       BadSignatureAlgorithmProblem,
-		Detail:     fmt.Sprintf(detail, a...),
+		Detail:     detail,
 		HTTPStatus: http.StatusBadRequest,
 	}
 }
@@ -198,10 +204,10 @@ func Malformed(detail string, a ...any) *ProblemDetails {
 }
 
 // OrderNotReady returns a ProblemDetails representing a OrderNotReadyProblem
-func OrderNotReady(detail string, a ...any) *ProblemDetails {
+func OrderNotReady(detail string) *ProblemDetails {
 	return &ProblemDetails{
 		Type:       OrderNotReadyProblem,
-		Detail:     fmt.Sprintf(detail, a...),
+		Detail:     detail,
 		HTTPStatus: http.StatusForbidden,
 	}
 }
@@ -210,6 +216,15 @@ func OrderNotReady(detail string, a ...any) *ProblemDetails {
 func RateLimited(detail string) *ProblemDetails {
 	return &ProblemDetails{
 		Type:       RateLimitedProblem,
+		Detail:     detail,
+		HTTPStatus: http.StatusTooManyRequests,
+	}
+}
+
+// Paused returns a ProblemDetails representing a RateLimitedProblem error
+func Paused(detail string) *ProblemDetails {
+	return &ProblemDetails{
+		Type:       PausedProblem,
 		Detail:     detail,
 		HTTPStatus: http.StatusTooManyRequests,
 	}
@@ -290,11 +305,11 @@ func Canceled(detail string, a ...any) *ProblemDetails {
 	}
 }
 
-// Conflict returns a ProblemDetails with a MalformedProblem and a 409 Conflict
+// Conflict returns a ProblemDetails with a ConflictProblem and a 409 Conflict
 // status code.
 func Conflict(detail string) *ProblemDetails {
 	return &ProblemDetails{
-		Type:       MalformedProblem,
+		Type:       ConflictProblem,
 		Detail:     detail,
 		HTTPStatus: http.StatusConflict,
 	}
@@ -337,5 +352,15 @@ func NotFound(detail string) *ProblemDetails {
 		Type:       MalformedProblem,
 		Detail:     detail,
 		HTTPStatus: http.StatusNotFound,
+	}
+}
+
+// InvalidProfile returns a ProblemDetails with type InvalidProfile, specified
+// in https://datatracker.ietf.org/doc/draft-aaron-acme-profiles/.
+func InvalidProfile(detail string) *ProblemDetails {
+	return &ProblemDetails{
+		Type:       InvalidProfileProblem,
+		Detail:     detail,
+		HTTPStatus: http.StatusBadRequest,
 	}
 }

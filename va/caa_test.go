@@ -2,13 +2,17 @@ package va
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
+	"regexp"
+	"slices"
 	"strings"
 	"testing"
 
 	"github.com/miekg/dns"
+	"github.com/prometheus/client_golang/prometheus"
 
 	"github.com/letsencrypt/boulder/bdns"
 	"github.com/letsencrypt/boulder/core"
@@ -190,14 +194,14 @@ func (mock caaMockDNS) LookupCAA(_ context.Context, domain string) ([]*dns.CAA, 
 }
 
 func TestCAATimeout(t *testing.T) {
-	va, _ := setup(nil, 0, "", nil, caaMockDNS{})
+	va, _ := setup(nil, "", nil, caaMockDNS{})
 
 	params := &caaParams{
 		accountURIID:     12345,
 		validationMethod: core.ChallengeTypeHTTP01,
 	}
 
-	err := va.checkCAA(ctx, identifier.DNSIdentifier("caa-timeout.com"), params)
+	err := va.checkCAA(ctx, identifier.NewDNS("caa-timeout.com"), params)
 	test.AssertErrorIs(t, err, berrors.DNS)
 	test.AssertContains(t, err.Error(), "error")
 }
@@ -407,14 +411,14 @@ func TestCAAChecking(t *testing.T) {
 	method := core.ChallengeTypeHTTP01
 	params := &caaParams{accountURIID: accountURIID, validationMethod: method}
 
-	va, _ := setup(nil, 0, "", nil, caaMockDNS{})
+	va, _ := setup(nil, "", nil, caaMockDNS{})
 	va.accountURIPrefixes = []string{"https://letsencrypt.org/acct/reg/"}
 
 	for _, caaTest := range testCases {
 		mockLog := va.log.(*blog.Mock)
 		defer mockLog.Clear()
 		t.Run(caaTest.Name, func(t *testing.T) {
-			ident := identifier.DNSIdentifier(caaTest.Domain)
+			ident := identifier.NewDNS(caaTest.Domain)
 			foundAt, valid, _, err := va.checkCAARecords(ctx, ident, params)
 			if err != nil {
 				t.Errorf("checkCAARecords error for %s: %s", caaTest.Domain, err)
@@ -430,7 +434,7 @@ func TestCAAChecking(t *testing.T) {
 }
 
 func TestCAALogging(t *testing.T) {
-	va, _ := setup(nil, 0, "", nil, caaMockDNS{})
+	va, _ := setup(nil, "", nil, caaMockDNS{})
 
 	testCases := []struct {
 		Name            string
@@ -504,7 +508,7 @@ func TestCAALogging(t *testing.T) {
 				accountURIID:     tc.AccountURIID,
 				validationMethod: tc.ChallengeType,
 			}
-			_ = va.checkCAA(ctx, identifier.ACMEIdentifier{Type: identifier.DNS, Value: tc.Domain}, params)
+			_ = va.checkCAA(ctx, identifier.NewDNS(tc.Domain), params)
 
 			caaLogLines := mockLog.GetAllMatching(`Checked CAA records for`)
 			if len(caaLogLines) != 1 {
@@ -517,57 +521,107 @@ func TestCAALogging(t *testing.T) {
 	}
 }
 
+type caaCheckFuncRunner func(context.Context, *ValidationAuthorityImpl, *vapb.IsCAAValidRequest) (*vapb.IsCAAValidResponse, error)
+
+var runIsCAAValid = func(ctx context.Context, va *ValidationAuthorityImpl, req *vapb.IsCAAValidRequest) (*vapb.IsCAAValidResponse, error) {
+	return va.IsCAAValid(ctx, req)
+}
+
+var runDoCAA = func(ctx context.Context, va *ValidationAuthorityImpl, req *vapb.IsCAAValidRequest) (*vapb.IsCAAValidResponse, error) {
+	return va.DoCAA(ctx, req)
+}
+
 // TestIsCAAValidErrMessage tests that an error result from `va.IsCAAValid`
 // includes the domain name that was being checked in the failure detail.
 func TestIsCAAValidErrMessage(t *testing.T) {
-	va, _ := setup(nil, 0, "", nil, caaMockDNS{})
+	t.Parallel()
+	va, _ := setup(nil, "", nil, caaMockDNS{})
 
-	// Call IsCAAValid with a domain we know fails with a generic error from the
-	// caaMockDNS.
-	domain := "caa-timeout.com"
-	resp, err := va.IsCAAValid(ctx, &vapb.IsCAAValidRequest{
-		Domain:           domain,
-		ValidationMethod: string(core.ChallengeTypeHTTP01),
-		AccountURIID:     12345,
-	})
+	testCases := []struct {
+		name         string
+		caaCheckFunc caaCheckFuncRunner
+	}{
+		{
+			name:         "IsCAAValid",
+			caaCheckFunc: runIsCAAValid,
+		},
+		{
+			name:         "DoCAA",
+			caaCheckFunc: runDoCAA,
+		},
+	}
 
-	// The lookup itself should not return an error
-	test.AssertNotError(t, err, "Unexpected error calling IsCAAValidRequest")
-	// The result should not be nil
-	test.AssertNotNil(t, resp, "Response to IsCAAValidRequest was nil")
-	// The result's Problem should not be nil
-	test.AssertNotNil(t, resp.Problem, "Response Problem was nil")
-	// The result's Problem should be an error message that includes the domain.
-	test.AssertEquals(t, resp.Problem.Detail, fmt.Sprintf("While processing CAA for %s: error", domain))
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			// Call the operation with a domain we know fails with a generic error from the
+			// caaMockDNS.
+			domain := "caa-timeout.com"
+			resp, err := tc.caaCheckFunc(ctx, va, &vapb.IsCAAValidRequest{
+				Domain:           domain,
+				ValidationMethod: string(core.ChallengeTypeHTTP01),
+				AccountURIID:     12345,
+			})
+
+			// The lookup itself should not return an error
+			test.AssertNotError(t, err, "Unexpected error calling IsCAAValidRequest")
+			// The result should not be nil
+			test.AssertNotNil(t, resp, "Response to IsCAAValidRequest was nil")
+			// The result's Problem should not be nil
+			test.AssertNotNil(t, resp.Problem, "Response Problem was nil")
+			// The result's Problem should be an error message that includes the domain.
+			test.AssertEquals(t, resp.Problem.Detail, fmt.Sprintf("While processing CAA for %s: error", domain))
+		})
+	}
 }
 
 // TestIsCAAValidParams tests that the IsCAAValid method rejects any requests
 // which do not have the necessary parameters to do CAA Account and Method
 // Binding checks.
 func TestIsCAAValidParams(t *testing.T) {
-	va, _ := setup(nil, 0, "", nil, caaMockDNS{})
+	t.Parallel()
+	va, _ := setup(nil, "", nil, caaMockDNS{})
+	testCases := []struct {
+		name         string
+		caaCheckFunc caaCheckFuncRunner
+	}{
+		{
+			name:         "IsCAAValid",
+			caaCheckFunc: runIsCAAValid,
+		},
+		{
+			name:         "DoCAA",
+			caaCheckFunc: runDoCAA,
+		},
+	}
 
-	// Calling IsCAAValid without a ValidationMethod should fail.
-	_, err := va.IsCAAValid(ctx, &vapb.IsCAAValidRequest{
-		Domain:       "present.com",
-		AccountURIID: 12345,
-	})
-	test.AssertError(t, err, "calling IsCAAValid without a ValidationMethod")
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 
-	// Calling IsCAAValid with an invalid ValidationMethod should fail.
-	_, err = va.IsCAAValid(ctx, &vapb.IsCAAValidRequest{
-		Domain:           "present.com",
-		ValidationMethod: "tls-sni-01",
-		AccountURIID:     12345,
-	})
-	test.AssertError(t, err, "calling IsCAAValid with a bad ValidationMethod")
+			// Calling IsCAAValid without a ValidationMethod should fail.
+			_, err := tc.caaCheckFunc(ctx, va, &vapb.IsCAAValidRequest{
+				Domain:       "present.com",
+				AccountURIID: 12345,
+			})
+			test.AssertError(t, err, "calling IsCAAValid without a ValidationMethod")
 
-	// Calling IsCAAValid without an AccountURIID should fail.
-	_, err = va.IsCAAValid(ctx, &vapb.IsCAAValidRequest{
-		Domain:           "present.com",
-		ValidationMethod: string(core.ChallengeTypeHTTP01),
-	})
-	test.AssertError(t, err, "calling IsCAAValid without an AccountURIID")
+			// Calling IsCAAValid with an invalid ValidationMethod should fail.
+			_, err = tc.caaCheckFunc(ctx, va, &vapb.IsCAAValidRequest{
+				Domain:           "present.com",
+				ValidationMethod: "tls-sni-01",
+				AccountURIID:     12345,
+			})
+			test.AssertError(t, err, "calling IsCAAValid with a bad ValidationMethod")
+
+			// Calling IsCAAValid without an AccountURIID should fail.
+			_, err = tc.caaCheckFunc(ctx, va, &vapb.IsCAAValidRequest{
+				Domain:           "present.com",
+				ValidationMethod: string(core.ChallengeTypeHTTP01),
+			})
+			test.AssertError(t, err, "calling IsCAAValid without an AccountURIID")
+		})
+	}
 }
 
 var errCAABrokenDNSClient = errors.New("dnsClient is broken")
@@ -589,13 +643,11 @@ func (b caaBrokenDNS) LookupCAA(_ context.Context, domain string) ([]*dns.CAA, s
 }
 
 func TestDisabledMultiCAARechecking(t *testing.T) {
-	brokenRVA := setupRemote(nil, "broken", caaBrokenDNS{})
-	remoteVAs := []RemoteVA{{brokenRVA, "broken"}}
-	va, _ := setup(nil, 0, "local", remoteVAs, nil)
+	remoteVAs := []remoteConf{{ua: "broken", rir: arin, dns: caaBrokenDNS{}}}
+	va, _ := setupWithRemotes(nil, "local", remoteVAs, nil)
 
 	features.Set(features.Config{
-		EnforceMultiCAA:     false,
-		MultiCAAFullResults: false,
+		EnforceMultiCAA: false,
 	})
 	defer features.Reset()
 
@@ -654,6 +706,25 @@ func (h caaHijackedDNS) LookupCAA(_ context.Context, domain string) ([]*dns.CAA,
 	return results, response, bdns.ResolverAddrs{"caaHijackedDNS"}, nil
 }
 
+// parseValidationLogEvent extracts ... from JSON={ ... } in a ValidateChallenge
+// audit log and returns it as a validationLogEvent struct.
+func parseValidationLogEvent(t *testing.T, log []string) validationLogEvent {
+	re := regexp.MustCompile(`JSON=\{.*\}`)
+	var audit validationLogEvent
+	for _, line := range log {
+		match := re.FindString(line)
+		if match != "" {
+			jsonStr := match[len(`JSON=`):]
+			if err := json.Unmarshal([]byte(jsonStr), &audit); err != nil {
+				t.Fatalf("Failed to parse JSON: %v", err)
+			}
+			return audit
+		}
+	}
+	t.Fatal("JSON not found in log")
+	return audit
+}
+
 func TestMultiCAARechecking(t *testing.T) {
 	// The remote differential log order is non-deterministic, so let's use
 	// the same UA for all applicable RVAs.
@@ -663,29 +734,51 @@ func TestMultiCAARechecking(t *testing.T) {
 		brokenUA   = "broken"
 		hijackedUA = "hijacked"
 	)
-	remoteVA := setupRemote(nil, remoteUA, nil)
-	brokenVA := setupRemote(nil, brokenUA, caaBrokenDNS{})
-	// Returns incorrect results
-	hijackedVA := setupRemote(nil, hijackedUA, caaHijackedDNS{})
+
+	type testFunc struct {
+		name string
+		impl caaCheckFuncRunner
+	}
+
+	testFuncs := []testFunc{
+		{
+			name: "IsCAAValid",
+			impl: runIsCAAValid,
+		},
+		{
+			name: "DoCAA",
+			impl: runDoCAA,
+		},
+	}
 
 	testCases := []struct {
-		name                     string
-		maxLookupFailures        int
+		name string
+		// method is only set inside of the test loop.
+		methodName               string
 		domains                  string
-		remoteVAs                []RemoteVA
+		remoteVAs                []remoteConf
 		expectedProbSubstring    string
 		expectedProbType         probs.ProblemType
 		expectedDiffLogSubstring string
+		expectedSummary          *mpicSummary
+		expectedLabels           prometheus.Labels
 		localDNSClient           bdns.Client
 	}{
 		{
 			name:           "all VAs functional, no CAA records",
 			domains:        "present-dns-only.com",
 			localDNSClient: caaMockDNS{},
-			remoteVAs: []RemoteVA{
-				{remoteVA, remoteUA},
-				{remoteVA, remoteUA},
-				{remoteVA, remoteUA},
+			remoteVAs: []remoteConf{
+				{ua: remoteUA, rir: arin},
+				{ua: remoteUA, rir: ripe},
+				{ua: remoteUA, rir: apnic},
+			},
+			expectedLabels: prometheus.Labels{
+				"operation":      opCAA,
+				"perspective":    allPerspectives,
+				"challenge_type": string(core.ChallengeTypeDNS01),
+				"problem_type":   "",
+				"result":         pass,
 			},
 		},
 		{
@@ -694,284 +787,457 @@ func TestMultiCAARechecking(t *testing.T) {
 			localDNSClient:        caaBrokenDNS{},
 			expectedProbSubstring: "While processing CAA for present-dns-only.com: dnsClient is broken",
 			expectedProbType:      probs.DNSProblem,
-			remoteVAs: []RemoteVA{
-				{remoteVA, remoteUA},
-				{remoteVA, remoteUA},
-				{remoteVA, remoteUA},
+			remoteVAs: []remoteConf{
+				{ua: remoteUA, rir: arin},
+				{ua: remoteUA, rir: ripe},
+				{ua: remoteUA, rir: apnic},
+			},
+			expectedLabels: prometheus.Labels{
+				"operation":      opCAA,
+				"perspective":    allPerspectives,
+				"challenge_type": string(core.ChallengeTypeDNS01),
+				"problem_type":   string(probs.DNSProblem),
+				"result":         fail,
 			},
 		},
 		{
 			name:                     "functional localVA, 1 broken RVA, no CAA records",
 			domains:                  "present-dns-only.com",
-			expectedProbSubstring:    "During secondary CAA checking: While processing CAA",
-			expectedProbType:         probs.DNSProblem,
-			expectedDiffLogSubstring: `RemoteSuccesses":2,"RemoteFailures":[{"VAHostname":"broken","Problem":{"type":"dns","detail":"While processing CAA for`,
 			localDNSClient:           caaMockDNS{},
-			remoteVAs: []RemoteVA{
-				{brokenVA, brokenUA},
-				{remoteVA, remoteUA},
-				{remoteVA, remoteUA},
+			expectedDiffLogSubstring: `"RemoteSuccesses":2,"RemoteFailures":1`,
+			expectedSummary: &mpicSummary{
+				Passed:       []string{"dc-1-RIPE", "dc-2-APNIC"},
+				Failed:       []string{"dc-0-ARIN"},
+				PassedRIRs:   []string{ripe, apnic},
+				QuorumResult: "2/3",
+			},
+			remoteVAs: []remoteConf{
+				{ua: brokenUA, rir: arin, dns: caaBrokenDNS{}},
+				{ua: remoteUA, rir: ripe},
+				{ua: remoteUA, rir: apnic},
+			},
+			expectedLabels: prometheus.Labels{
+				"operation":      opCAA,
+				"perspective":    allPerspectives,
+				"challenge_type": string(core.ChallengeTypeDNS01),
+				"problem_type":   "",
+				"result":         pass,
+			},
+		},
+		{
+			name:                     "functional localVA, 2 broken RVA, no CAA records",
+			domains:                  "present-dns-only.com",
+			expectedProbSubstring:    "During secondary validation: While processing CAA",
+			expectedProbType:         probs.DNSProblem,
+			expectedDiffLogSubstring: `"RemoteSuccesses":1,"RemoteFailures":2`,
+			expectedSummary: &mpicSummary{
+				Passed:       []string{"dc-2-APNIC"},
+				Failed:       []string{"dc-0-ARIN", "dc-1-RIPE"},
+				PassedRIRs:   []string{apnic},
+				QuorumResult: "1/3",
+			},
+			localDNSClient: caaMockDNS{},
+			remoteVAs: []remoteConf{
+				{ua: brokenUA, rir: arin, dns: caaBrokenDNS{}},
+				{ua: brokenUA, rir: ripe, dns: caaBrokenDNS{}},
+				{ua: remoteUA, rir: apnic},
+			},
+			expectedLabels: prometheus.Labels{
+				"operation":      opCAA,
+				"perspective":    allPerspectives,
+				"challenge_type": string(core.ChallengeTypeDNS01),
+				"problem_type":   string(probs.DNSProblem),
+				"result":         fail,
 			},
 		},
 		{
 			name:                     "functional localVA, all broken RVAs, no CAA records",
 			domains:                  "present-dns-only.com",
-			expectedProbSubstring:    "During secondary CAA checking: While processing CAA",
+			expectedProbSubstring:    "During secondary validation: While processing CAA",
 			expectedProbType:         probs.DNSProblem,
-			expectedDiffLogSubstring: `RemoteSuccesses":0,"RemoteFailures":[{"VAHostname":"broken","Problem":{"type":"dns","detail":"While processing CAA for`,
-			localDNSClient:           caaMockDNS{},
-			remoteVAs: []RemoteVA{
-				{brokenVA, brokenUA},
-				{brokenVA, brokenUA},
-				{brokenVA, brokenUA},
+			expectedDiffLogSubstring: `"RemoteSuccesses":0,"RemoteFailures":3`,
+			expectedSummary: &mpicSummary{
+				Passed:       []string{},
+				Failed:       []string{"dc-0-ARIN", "dc-1-RIPE", "dc-2-APNIC"},
+				PassedRIRs:   []string{},
+				QuorumResult: "0/3",
+			},
+			localDNSClient: caaMockDNS{},
+			remoteVAs: []remoteConf{
+				{ua: brokenUA, rir: arin, dns: caaBrokenDNS{}},
+				{ua: brokenUA, rir: ripe, dns: caaBrokenDNS{}},
+				{ua: brokenUA, rir: apnic, dns: caaBrokenDNS{}},
+			},
+			expectedLabels: prometheus.Labels{
+				"operation":      opCAA,
+				"perspective":    allPerspectives,
+				"challenge_type": string(core.ChallengeTypeDNS01),
+				"problem_type":   string(probs.DNSProblem),
+				"result":         fail,
 			},
 		},
 		{
 			name:           "all VAs functional, CAA issue type present",
 			domains:        "present.com",
 			localDNSClient: caaMockDNS{},
-			remoteVAs: []RemoteVA{
-				{remoteVA, remoteUA},
-				{remoteVA, remoteUA},
-				{remoteVA, remoteUA},
+			remoteVAs: []remoteConf{
+				{ua: remoteUA, rir: arin},
+				{ua: remoteUA, rir: ripe},
+				{ua: remoteUA, rir: apnic},
+			},
+			expectedLabels: prometheus.Labels{
+				"operation":      opCAA,
+				"perspective":    allPerspectives,
+				"challenge_type": string(core.ChallengeTypeDNS01),
+				"problem_type":   "",
+				"result":         pass,
 			},
 		},
 		{
 			name:                     "functional localVA, 1 broken RVA, CAA issue type present",
 			domains:                  "present.com",
-			expectedProbSubstring:    "During secondary CAA checking: While processing CAA",
+			expectedDiffLogSubstring: `"RemoteSuccesses":2,"RemoteFailures":1`,
+			expectedSummary: &mpicSummary{
+				Passed:       []string{"dc-1-RIPE", "dc-2-APNIC"},
+				Failed:       []string{"dc-0-ARIN"},
+				PassedRIRs:   []string{ripe, apnic},
+				QuorumResult: "2/3",
+			},
+			localDNSClient: caaMockDNS{},
+			remoteVAs: []remoteConf{
+				{ua: brokenUA, rir: arin, dns: caaBrokenDNS{}},
+				{ua: remoteUA, rir: ripe},
+				{ua: remoteUA, rir: apnic},
+			},
+			expectedLabels: prometheus.Labels{
+				"operation":      opCAA,
+				"perspective":    allPerspectives,
+				"challenge_type": string(core.ChallengeTypeDNS01),
+				"problem_type":   "",
+				"result":         pass,
+			},
+		},
+		{
+			name:                     "functional localVA, 2 broken RVA, CAA issue type present",
+			domains:                  "present.com",
+			expectedProbSubstring:    "During secondary validation: While processing CAA",
 			expectedProbType:         probs.DNSProblem,
-			expectedDiffLogSubstring: `RemoteSuccesses":2,"RemoteFailures":[{"VAHostname":"broken","Problem":{"type":"dns","detail":"While processing CAA for`,
-			localDNSClient:           caaMockDNS{},
-			remoteVAs: []RemoteVA{
-				{brokenVA, brokenUA},
-				{remoteVA, remoteUA},
-				{remoteVA, remoteUA},
+			expectedDiffLogSubstring: `"RemoteSuccesses":1,"RemoteFailures":2`,
+			expectedSummary: &mpicSummary{
+				Passed:       []string{"dc-2-APNIC"},
+				Failed:       []string{"dc-0-ARIN", "dc-1-RIPE"},
+				PassedRIRs:   []string{apnic},
+				QuorumResult: "1/3",
+			},
+			localDNSClient: caaMockDNS{},
+			remoteVAs: []remoteConf{
+				{ua: brokenUA, rir: arin, dns: caaBrokenDNS{}},
+				{ua: brokenUA, rir: ripe, dns: caaBrokenDNS{}},
+				{ua: remoteUA, rir: apnic},
+			},
+			expectedLabels: prometheus.Labels{
+				"operation":      opCAA,
+				"perspective":    allPerspectives,
+				"challenge_type": string(core.ChallengeTypeDNS01),
+				"problem_type":   string(probs.DNSProblem),
+				"result":         fail,
 			},
 		},
 		{
 			name:                     "functional localVA, all broken RVAs, CAA issue type present",
 			domains:                  "present.com",
-			expectedProbSubstring:    "During secondary CAA checking: While processing CAA",
+			expectedProbSubstring:    "During secondary validation: While processing CAA",
 			expectedProbType:         probs.DNSProblem,
-			expectedDiffLogSubstring: `RemoteSuccesses":0,"RemoteFailures":[{"VAHostname":"broken","Problem":{"type":"dns","detail":"While processing CAA for`,
-			localDNSClient:           caaMockDNS{},
-			remoteVAs: []RemoteVA{
-				{brokenVA, brokenUA},
-				{brokenVA, brokenUA},
-				{brokenVA, brokenUA},
+			expectedDiffLogSubstring: `"RemoteSuccesses":0,"RemoteFailures":3`,
+			expectedSummary: &mpicSummary{
+				Passed:       []string{},
+				Failed:       []string{"dc-0-ARIN", "dc-1-RIPE", "dc-2-APNIC"},
+				PassedRIRs:   []string{},
+				QuorumResult: "0/3",
+			},
+			localDNSClient: caaMockDNS{},
+			remoteVAs: []remoteConf{
+				{ua: brokenUA, rir: arin, dns: caaBrokenDNS{}},
+				{ua: brokenUA, rir: ripe, dns: caaBrokenDNS{}},
+				{ua: brokenUA, rir: apnic, dns: caaBrokenDNS{}},
+			},
+			expectedLabels: prometheus.Labels{
+				"operation":      opCAA,
+				"perspective":    allPerspectives,
+				"challenge_type": string(core.ChallengeTypeDNS01),
+				"problem_type":   string(probs.DNSProblem),
+				"result":         fail,
 			},
 		},
 		{
-			// The localVA kicks off the background goroutines before doing its
-			// own check. But if its own check fails, it doesn't wait for their
-			// results.
+			// The localVA returns early with a problem before kicking off the
+			// remote checks.
 			name:                  "all VAs functional, CAA issue type forbids issuance",
 			domains:               "unsatisfiable.com",
 			expectedProbSubstring: "CAA record for unsatisfiable.com prevents issuance",
 			expectedProbType:      probs.CAAProblem,
 			localDNSClient:        caaMockDNS{},
-			remoteVAs: []RemoteVA{
-				{remoteVA, remoteUA},
-				{remoteVA, remoteUA},
-				{remoteVA, remoteUA},
+			remoteVAs: []remoteConf{
+				{ua: remoteUA, rir: arin},
+				{ua: remoteUA, rir: ripe},
+				{ua: remoteUA, rir: apnic},
 			},
 		},
 		{
 			name:                     "1 hijacked RVA, CAA issue type present",
 			domains:                  "present.com",
-			expectedProbSubstring:    "CAA record for present.com prevents issuance",
-			expectedProbType:         probs.CAAProblem,
-			expectedDiffLogSubstring: `RemoteSuccesses":2,"RemoteFailures":[{"VAHostname":"hijacked","Problem":{"type":"caa","detail":"While processing CAA for`,
-			localDNSClient:           caaMockDNS{},
-			remoteVAs: []RemoteVA{
-				{hijackedVA, hijackedUA},
-				{remoteVA, remoteUA},
-				{remoteVA, remoteUA},
+			expectedDiffLogSubstring: `"RemoteSuccesses":2,"RemoteFailures":1`,
+			expectedSummary: &mpicSummary{
+				Passed:       []string{"dc-1-RIPE", "dc-2-APNIC"},
+				Failed:       []string{"dc-0-ARIN"},
+				PassedRIRs:   []string{ripe, apnic},
+				QuorumResult: "2/3",
+			},
+			localDNSClient: caaMockDNS{},
+			remoteVAs: []remoteConf{
+				{ua: hijackedUA, rir: arin, dns: caaHijackedDNS{}},
+				{ua: remoteUA, rir: ripe},
+				{ua: remoteUA, rir: apnic},
 			},
 		},
 		{
 			name:                     "2 hijacked RVAs, CAA issue type present",
 			domains:                  "present.com",
-			expectedProbSubstring:    "During secondary CAA checking: While processing CAA",
+			expectedProbSubstring:    "During secondary validation: While processing CAA",
 			expectedProbType:         probs.CAAProblem,
-			expectedDiffLogSubstring: `RemoteSuccesses":1,"RemoteFailures":[{"VAHostname":"hijacked","Problem":{"type":"caa","detail":"While processing CAA for`,
-			localDNSClient:           caaMockDNS{},
-			remoteVAs: []RemoteVA{
-				{hijackedVA, hijackedUA},
-				{hijackedVA, hijackedUA},
-				{remoteVA, remoteUA},
+			expectedDiffLogSubstring: `"RemoteSuccesses":1,"RemoteFailures":2`,
+			expectedSummary: &mpicSummary{
+				Passed:       []string{"dc-2-APNIC"},
+				Failed:       []string{"dc-0-ARIN", "dc-1-RIPE"},
+				PassedRIRs:   []string{apnic},
+				QuorumResult: "1/3",
+			},
+			localDNSClient: caaMockDNS{},
+			remoteVAs: []remoteConf{
+				{ua: hijackedUA, rir: arin, dns: caaHijackedDNS{}},
+				{ua: hijackedUA, rir: ripe, dns: caaHijackedDNS{}},
+				{ua: remoteUA, rir: apnic},
 			},
 		},
 		{
 			name:                     "3 hijacked RVAs, CAA issue type present",
 			domains:                  "present.com",
-			expectedProbSubstring:    "During secondary CAA checking: While processing CAA",
+			expectedProbSubstring:    "During secondary validation: While processing CAA",
 			expectedProbType:         probs.CAAProblem,
-			expectedDiffLogSubstring: `RemoteSuccesses":0,"RemoteFailures":[{"VAHostname":"hijacked","Problem":{"type":"caa","detail":"While processing CAA for`,
-			localDNSClient:           caaMockDNS{},
-			remoteVAs: []RemoteVA{
-				{hijackedVA, hijackedUA},
-				{hijackedVA, hijackedUA},
-				{hijackedVA, hijackedUA},
+			expectedDiffLogSubstring: `"RemoteSuccesses":0,"RemoteFailures":3`,
+			expectedSummary: &mpicSummary{
+				Passed:       []string{},
+				Failed:       []string{"dc-0-ARIN", "dc-1-RIPE", "dc-2-APNIC"},
+				PassedRIRs:   []string{},
+				QuorumResult: "0/3",
+			},
+			localDNSClient: caaMockDNS{},
+			remoteVAs: []remoteConf{
+				{ua: hijackedUA, rir: arin, dns: caaHijackedDNS{}},
+				{ua: hijackedUA, rir: ripe, dns: caaHijackedDNS{}},
+				{ua: hijackedUA, rir: apnic, dns: caaHijackedDNS{}},
 			},
 		},
 		{
 			name:                     "1 hijacked RVA, CAA issuewild type present",
 			domains:                  "satisfiable-wildcard.com",
-			expectedProbSubstring:    "During secondary CAA checking: While processing CAA",
-			expectedProbType:         probs.CAAProblem,
-			expectedDiffLogSubstring: `RemoteSuccesses":2,"RemoteFailures":[{"VAHostname":"hijacked","Problem":{"type":"caa","detail":"While processing CAA for`,
-			localDNSClient:           caaMockDNS{},
-			remoteVAs: []RemoteVA{
-				{hijackedVA, hijackedUA},
-				{remoteVA, remoteUA},
-				{remoteVA, remoteUA},
+			expectedDiffLogSubstring: `"RemoteSuccesses":2,"RemoteFailures":1`,
+			expectedSummary: &mpicSummary{
+				Passed:       []string{"dc-1-RIPE", "dc-2-APNIC"},
+				Failed:       []string{"dc-0-ARIN"},
+				PassedRIRs:   []string{ripe, apnic},
+				QuorumResult: "2/3",
+			},
+			localDNSClient: caaMockDNS{},
+			remoteVAs: []remoteConf{
+				{ua: hijackedUA, rir: arin, dns: caaHijackedDNS{}},
+				{ua: remoteUA, rir: ripe},
+				{ua: remoteUA, rir: apnic},
 			},
 		},
 		{
 			name:                     "2 hijacked RVAs, CAA issuewild type present",
 			domains:                  "satisfiable-wildcard.com",
-			expectedProbSubstring:    "During secondary CAA checking: While processing CAA",
+			expectedProbSubstring:    "During secondary validation: While processing CAA",
 			expectedProbType:         probs.CAAProblem,
-			expectedDiffLogSubstring: `RemoteSuccesses":1,"RemoteFailures":[{"VAHostname":"hijacked","Problem":{"type":"caa","detail":"While processing CAA for`,
-			localDNSClient:           caaMockDNS{},
-			remoteVAs: []RemoteVA{
-				{hijackedVA, hijackedUA},
-				{hijackedVA, hijackedUA},
-				{remoteVA, remoteUA},
+			expectedDiffLogSubstring: `"RemoteSuccesses":1,"RemoteFailures":2`,
+			expectedSummary: &mpicSummary{
+				Passed:       []string{"dc-2-APNIC"},
+				Failed:       []string{"dc-0-ARIN", "dc-1-RIPE"},
+				PassedRIRs:   []string{apnic},
+				QuorumResult: "1/3",
+			},
+			localDNSClient: caaMockDNS{},
+			remoteVAs: []remoteConf{
+				{ua: hijackedUA, rir: arin, dns: caaHijackedDNS{}},
+				{ua: hijackedUA, rir: ripe, dns: caaHijackedDNS{}},
+				{ua: remoteUA, rir: apnic},
 			},
 		},
 		{
 			name:                     "3 hijacked RVAs, CAA issuewild type present",
 			domains:                  "satisfiable-wildcard.com",
-			expectedProbSubstring:    "During secondary CAA checking: While processing CAA",
+			expectedProbSubstring:    "During secondary validation: While processing CAA",
 			expectedProbType:         probs.CAAProblem,
-			expectedDiffLogSubstring: `RemoteSuccesses":0,"RemoteFailures":[{"VAHostname":"hijacked","Problem":{"type":"caa","detail":"While processing CAA for`,
-			localDNSClient:           caaMockDNS{},
-			remoteVAs: []RemoteVA{
-				{hijackedVA, hijackedUA},
-				{hijackedVA, hijackedUA},
-				{hijackedVA, hijackedUA},
+			expectedDiffLogSubstring: `"RemoteSuccesses":0,"RemoteFailures":3`,
+			expectedSummary: &mpicSummary{
+				Passed:       []string{},
+				Failed:       []string{"dc-0-ARIN", "dc-1-RIPE", "dc-2-APNIC"},
+				PassedRIRs:   []string{},
+				QuorumResult: "0/3",
+			},
+			localDNSClient: caaMockDNS{},
+			remoteVAs: []remoteConf{
+				{ua: hijackedUA, rir: arin, dns: caaHijackedDNS{}},
+				{ua: hijackedUA, rir: ripe, dns: caaHijackedDNS{}},
+				{ua: hijackedUA, rir: apnic, dns: caaHijackedDNS{}},
 			},
 		},
 		{
 			name:                     "1 hijacked RVA, CAA issuewild type present, 1 failure allowed",
 			domains:                  "satisfiable-wildcard.com",
-			maxLookupFailures:        1,
-			expectedDiffLogSubstring: `RemoteSuccesses":2,"RemoteFailures":[{"VAHostname":"hijacked","Problem":{"type":"caa","detail":"While processing CAA for`,
-			localDNSClient:           caaMockDNS{},
-			remoteVAs: []RemoteVA{
-				{hijackedVA, hijackedUA},
-				{remoteVA, remoteUA},
-				{remoteVA, remoteUA},
+			expectedDiffLogSubstring: `"RemoteSuccesses":2,"RemoteFailures":1`,
+			expectedSummary: &mpicSummary{
+				Passed:       []string{"dc-1-RIPE", "dc-2-APNIC"},
+				Failed:       []string{"dc-0-ARIN"},
+				PassedRIRs:   []string{ripe, apnic},
+				QuorumResult: "2/3",
+			},
+			localDNSClient: caaMockDNS{},
+			remoteVAs: []remoteConf{
+				{ua: hijackedUA, rir: arin, dns: caaHijackedDNS{}},
+				{ua: remoteUA, rir: ripe},
+				{ua: remoteUA, rir: apnic},
 			},
 		},
 		{
 			name:                     "2 hijacked RVAs, CAA issuewild type present, 1 failure allowed",
 			domains:                  "satisfiable-wildcard.com",
-			maxLookupFailures:        1,
-			expectedProbSubstring:    "During secondary CAA checking: While processing CAA",
+			expectedProbSubstring:    "During secondary validation: While processing CAA",
 			expectedProbType:         probs.CAAProblem,
-			expectedDiffLogSubstring: `RemoteSuccesses":1,"RemoteFailures":[{"VAHostname":"hijacked","Problem":{"type":"caa","detail":"While processing CAA for`,
-			localDNSClient:           caaMockDNS{},
-			remoteVAs: []RemoteVA{
-				{hijackedVA, hijackedUA},
-				{hijackedVA, hijackedUA},
-				{remoteVA, remoteUA},
+			expectedDiffLogSubstring: `"RemoteSuccesses":1,"RemoteFailures":2`,
+			expectedSummary: &mpicSummary{
+				Passed:       []string{"dc-2-APNIC"},
+				Failed:       []string{"dc-0-ARIN", "dc-1-RIPE"},
+				PassedRIRs:   []string{apnic},
+				QuorumResult: "1/3",
+			},
+			localDNSClient: caaMockDNS{},
+			remoteVAs: []remoteConf{
+				{ua: hijackedUA, rir: arin, dns: caaHijackedDNS{}},
+				{ua: hijackedUA, rir: ripe, dns: caaHijackedDNS{}},
+				{ua: remoteUA, rir: apnic},
 			},
 		},
 		{
 			name:                     "3 hijacked RVAs, CAA issuewild type present, 1 failure allowed",
 			domains:                  "satisfiable-wildcard.com",
-			maxLookupFailures:        1,
-			expectedProbSubstring:    "During secondary CAA checking: While processing CAA",
+			expectedProbSubstring:    "During secondary validation: While processing CAA",
 			expectedProbType:         probs.CAAProblem,
-			expectedDiffLogSubstring: `RemoteSuccesses":0,"RemoteFailures":[{"VAHostname":"hijacked","Problem":{"type":"caa","detail":"While processing CAA for`,
-			localDNSClient:           caaMockDNS{},
-			remoteVAs: []RemoteVA{
-				{hijackedVA, hijackedUA},
-				{hijackedVA, hijackedUA},
-				{hijackedVA, hijackedUA},
+			expectedDiffLogSubstring: `"RemoteSuccesses":0,"RemoteFailures":3`,
+			expectedSummary: &mpicSummary{
+				Passed:       []string{},
+				Failed:       []string{"dc-0-ARIN", "dc-1-RIPE", "dc-2-APNIC"},
+				PassedRIRs:   []string{},
+				QuorumResult: "0/3",
+			},
+			localDNSClient: caaMockDNS{},
+			remoteVAs: []remoteConf{
+				{ua: hijackedUA, rir: arin, dns: caaHijackedDNS{}},
+				{ua: hijackedUA, rir: ripe, dns: caaHijackedDNS{}},
+				{ua: hijackedUA, rir: apnic, dns: caaHijackedDNS{}},
 			},
 		},
 	}
 
 	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			va, mockLog := setup(nil, tc.maxLookupFailures, localUA, tc.remoteVAs, tc.localDNSClient)
-			defer mockLog.Clear()
+		for _, testFunc := range testFuncs {
+			t.Run(tc.name+"_"+testFunc.name, func(t *testing.T) {
+				va, mockLog := setupWithRemotes(nil, localUA, tc.remoteVAs, tc.localDNSClient)
+				defer mockLog.Clear()
 
-			// MultiCAAFullResults: false is inherently flaky because of the
-			// non-deterministic nature of concurrent goroutine returns. We,
-			// boulder dev, made a decision to skip testing that path and
-			// eventually make MultiCAAFullResults: true the default.
-			features.Set(features.Config{
-				EnforceMultiCAA:     true,
-				MultiCAAFullResults: true,
-			})
-			defer features.Reset()
+				features.Set(features.Config{
+					EnforceMultiCAA: true,
+				})
+				defer features.Reset()
 
-			isValidRes, err := va.IsCAAValid(context.TODO(), &vapb.IsCAAValidRequest{
-				Domain:           tc.domains,
-				ValidationMethod: string(core.ChallengeTypeDNS01),
-				AccountURIID:     1,
-			})
-			test.AssertNotError(t, err, "Should not have errored, but did")
+				isValidRes, err := testFunc.impl(context.TODO(), va, &vapb.IsCAAValidRequest{
+					Domain:           tc.domains,
+					ValidationMethod: string(core.ChallengeTypeDNS01),
+					AccountURIID:     1,
+				})
+				test.AssertNotError(t, err, "Should not have errored, but did")
 
-			if tc.expectedProbSubstring != "" {
-				test.AssertContains(t, isValidRes.Problem.Detail, tc.expectedProbSubstring)
-			} else if isValidRes.Problem != nil {
-				test.AssertBoxedNil(t, isValidRes.Problem, "IsCAAValidRequest returned a problem, but should not have")
-			}
-
-			if tc.expectedProbType != "" {
-				test.AssertEquals(t, string(tc.expectedProbType), isValidRes.Problem.ProblemType)
-			}
-
-			var invalidRVACount int
-			for _, x := range va.remoteVAs {
-				if x.Address == "broken" || x.Address == "hijacked" {
-					invalidRVACount++
+				if tc.expectedProbSubstring != "" {
+					test.AssertNotNil(t, isValidRes.Problem, "IsCAAValidRequest returned nil problem, but should not have")
+					test.AssertContains(t, isValidRes.Problem.Detail, tc.expectedProbSubstring)
+				} else if isValidRes.Problem != nil {
+					test.AssertBoxedNil(t, isValidRes.Problem, "IsCAAValidRequest returned a problem, but should not have")
 				}
-			}
 
-			gotRequestProbs := mockLog.GetAllMatching(".IsCAAValid returned problem: ")
-			test.AssertEquals(t, len(gotRequestProbs), invalidRVACount)
+				if tc.expectedProbType != "" {
+					test.AssertNotNil(t, isValidRes.Problem, "IsCAAValidRequest returned nil problem, but should not have")
+					test.AssertEquals(t, string(tc.expectedProbType), isValidRes.Problem.ProblemType)
+				}
 
-			gotDifferential := mockLog.GetAllMatching("remoteVADifferentials JSON=.*")
-			if features.Get().MultiCAAFullResults && tc.expectedDiffLogSubstring != "" {
-				test.AssertEquals(t, len(gotDifferential), 1)
-				test.AssertContains(t, gotDifferential[0], tc.expectedDiffLogSubstring)
-			} else {
-				test.AssertEquals(t, len(gotDifferential), 0)
-			}
+				if testFunc.name == "IsCAAValid" {
+					var invalidRVACount int
+					for _, x := range tc.remoteVAs {
+						if x.ua == brokenUA || x.ua == hijackedUA {
+							invalidRVACount++
+						}
+					}
 
-			gotAnyRemoteFailures := mockLog.GetAllMatching("CAA check failed due to remote failures:")
-			if len(gotAnyRemoteFailures) >= 1 {
-				// The primary VA only emits this line once.
-				test.AssertEquals(t, len(gotAnyRemoteFailures), 1)
-			} else {
-				test.AssertEquals(t, len(gotAnyRemoteFailures), 0)
-			}
-		})
+					gotRequestProbs := mockLog.GetAllMatching(" returned a problem: ")
+					test.AssertEquals(t, len(gotRequestProbs), invalidRVACount)
+
+					gotDifferential := mockLog.GetAllMatching("remoteVADifferentials JSON=.*")
+					if tc.expectedDiffLogSubstring != "" {
+						test.AssertEquals(t, len(gotDifferential), 1)
+						test.AssertContains(t, gotDifferential[0], tc.expectedDiffLogSubstring)
+					} else {
+						test.AssertEquals(t, len(gotDifferential), 0)
+					}
+				}
+
+				if testFunc.name == "DoCAA" && tc.expectedSummary != nil {
+					gotAuditLog := parseValidationLogEvent(t, mockLog.GetAllMatching("JSON=.*"))
+					slices.Sort(tc.expectedSummary.Passed)
+					slices.Sort(tc.expectedSummary.Failed)
+					slices.Sort(tc.expectedSummary.PassedRIRs)
+					test.AssertDeepEquals(t, gotAuditLog.Summary, tc.expectedSummary)
+				}
+
+				gotAnyRemoteFailures := mockLog.GetAllMatching("CAA check failed due to remote failures:")
+				if len(gotAnyRemoteFailures) >= 1 {
+					// The primary VA only emits this line once.
+					test.AssertEquals(t, len(gotAnyRemoteFailures), 1)
+				} else {
+					test.AssertEquals(t, len(gotAnyRemoteFailures), 0)
+				}
+
+				if tc.expectedLabels != nil {
+					test.AssertMetricWithLabelsEquals(t, va.metrics.validationLatency, tc.expectedLabels, 1)
+				}
+
+			})
+		}
 	}
 }
 
 func TestCAAFailure(t *testing.T) {
-	chall := createChallenge(core.ChallengeTypeHTTP01)
-	hs := httpSrv(t, chall.Token)
+	hs := httpSrv(t, expectedToken)
 	defer hs.Close()
 
-	va, _ := setup(hs, 0, "", nil, caaMockDNS{})
+	va, _ := setup(hs, "", nil, caaMockDNS{})
 
-	_, err := va.validate(ctx, dnsi("reserved.com"), 1, chall)
+	err := va.checkCAA(ctx, dnsi("reserved.com"), &caaParams{1, core.ChallengeTypeHTTP01})
 	if err == nil {
 		t.Fatalf("Expected CAA rejection for reserved.com, got success")
 	}
 	test.AssertErrorIs(t, err, berrors.CAA)
 
-	_, err = va.validate(ctx, dnsi("example.gonetld"), 1, chall)
+	err = va.checkCAA(ctx, dnsi("example.gonetld"), &caaParams{1, core.ChallengeTypeHTTP01})
 	if err == nil {
 		t.Fatalf("Expected CAA rejection for gonetld, got success")
 	}
@@ -1110,16 +1376,17 @@ func TestSelectCAA(t *testing.T) {
 }
 
 func TestAccountURIMatches(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name     string
-		params   map[string]string
+		params   []caaParameter
 		prefixes []string
 		id       int64
 		want     bool
 	}{
 		{
 			name:   "empty accounturi",
-			params: map[string]string{},
+			params: nil,
 			prefixes: []string{
 				"https://acme-v01.api.letsencrypt.org/acme/reg/",
 			},
@@ -1127,10 +1394,17 @@ func TestAccountURIMatches(t *testing.T) {
 			want: true,
 		},
 		{
-			name: "non-uri accounturi",
-			params: map[string]string{
-				"accounturi": "\\invalid 😎/123456",
+			name:   "no accounturi in rr, but other parameters exist",
+			params: []caaParameter{{tag: "validationmethods", val: "tls-alpn-01"}},
+			prefixes: []string{
+				"https://acme-v02.api.letsencrypt.org/acme/reg/",
 			},
+			id:   123456,
+			want: true,
+		},
+		{
+			name:   "non-uri accounturi",
+			params: []caaParameter{{tag: "accounturi", val: "\\invalid 😎/123456"}},
 			prefixes: []string{
 				"\\invalid 😎",
 			},
@@ -1138,10 +1412,8 @@ func TestAccountURIMatches(t *testing.T) {
 			want: false,
 		},
 		{
-			name: "simple match",
-			params: map[string]string{
-				"accounturi": "https://acme-v01.api.letsencrypt.org/acme/reg/123456",
-			},
+			name:   "simple match",
+			params: []caaParameter{{tag: "accounturi", val: "https://acme-v01.api.letsencrypt.org/acme/reg/123456"}},
 			prefixes: []string{
 				"https://acme-v01.api.letsencrypt.org/acme/reg/",
 			},
@@ -1149,10 +1421,17 @@ func TestAccountURIMatches(t *testing.T) {
 			want: true,
 		},
 		{
-			name: "accountid mismatch",
-			params: map[string]string{
-				"accounturi": "https://acme-v01.api.letsencrypt.org/acme/reg/123456",
+			name:   "simple match, but has a friend",
+			params: []caaParameter{{tag: "validationmethods", val: "dns-01"}, {tag: "accounturi", val: "https://acme-v01.api.letsencrypt.org/acme/reg/123456"}},
+			prefixes: []string{
+				"https://acme-v01.api.letsencrypt.org/acme/reg/",
 			},
+			id:   123456,
+			want: true,
+		},
+		{
+			name:   "accountid mismatch",
+			params: []caaParameter{{tag: "accounturi", val: "https://acme-v01.api.letsencrypt.org/acme/reg/123456"}},
 			prefixes: []string{
 				"https://acme-v01.api.letsencrypt.org/acme/reg/",
 			},
@@ -1160,10 +1439,53 @@ func TestAccountURIMatches(t *testing.T) {
 			want: false,
 		},
 		{
-			name: "multiple prefixes, match first",
-			params: map[string]string{
-				"accounturi": "https://acme-staging.api.letsencrypt.org/acme/reg/123456",
+			name:   "single parameter, no value",
+			params: []caaParameter{{tag: "accounturi", val: ""}},
+			prefixes: []string{
+				"https://acme-v02.api.letsencrypt.org/acme/reg/",
 			},
+			id:   123456,
+			want: false,
+		},
+		{
+			name:   "multiple parameters, each with no value",
+			params: []caaParameter{{tag: "accounturi", val: ""}, {tag: "accounturi", val: ""}},
+			prefixes: []string{
+				"https://acme-v02.api.letsencrypt.org/acme/reg/",
+			},
+			id:   123456,
+			want: false,
+		},
+		{
+			name:   "multiple parameters, one with no value",
+			params: []caaParameter{{tag: "accounturi", val: ""}, {tag: "accounturi", val: "https://acme-v02.api.letsencrypt.org/acme/reg/123456"}},
+			prefixes: []string{
+				"https://acme-v02.api.letsencrypt.org/acme/reg/",
+			},
+			id:   123456,
+			want: false,
+		},
+		{
+			name:   "multiple parameters, each with an identical value",
+			params: []caaParameter{{tag: "accounturi", val: "https://acme-v02.api.letsencrypt.org/acme/reg/123456"}, {tag: "accounturi", val: "https://acme-v02.api.letsencrypt.org/acme/reg/123456"}},
+			prefixes: []string{
+				"https://acme-v02.api.letsencrypt.org/acme/reg/",
+			},
+			id:   123456,
+			want: false,
+		},
+		{
+			name:   "multiple parameters, each with a different value",
+			params: []caaParameter{{tag: "accounturi", val: "https://acme-v02.api.letsencrypt.org/acme/reg/69"}, {tag: "accounturi", val: "https://acme-v02.api.letsencrypt.org/acme/reg/420"}},
+			prefixes: []string{
+				"https://acme-v02.api.letsencrypt.org/acme/reg/",
+			},
+			id:   69,
+			want: false,
+		},
+		{
+			name:   "multiple prefixes, match first",
+			params: []caaParameter{{tag: "accounturi", val: "https://acme-staging.api.letsencrypt.org/acme/reg/123456"}},
 			prefixes: []string{
 				"https://acme-staging.api.letsencrypt.org/acme/reg/",
 				"https://acme-staging-v02.api.letsencrypt.org/acme/acct/",
@@ -1172,10 +1494,8 @@ func TestAccountURIMatches(t *testing.T) {
 			want: true,
 		},
 		{
-			name: "multiple prefixes, match second",
-			params: map[string]string{
-				"accounturi": "https://acme-v02.api.letsencrypt.org/acme/acct/123456",
-			},
+			name:   "multiple prefixes, match second",
+			params: []caaParameter{{tag: "accounturi", val: "https://acme-v02.api.letsencrypt.org/acme/acct/123456"}},
 			prefixes: []string{
 				"https://acme-v01.api.letsencrypt.org/acme/reg/",
 				"https://acme-v02.api.letsencrypt.org/acme/acct/",
@@ -1184,10 +1504,8 @@ func TestAccountURIMatches(t *testing.T) {
 			want: true,
 		},
 		{
-			name: "multiple prefixes, match none",
-			params: map[string]string{
-				"accounturi": "https://acme-v02.api.letsencrypt.org/acme/acct/123456",
-			},
+			name:   "multiple prefixes, match none",
+			params: []caaParameter{{tag: "accounturi", val: "https://acme-v02.api.letsencrypt.org/acme/acct/123456"}},
 			prefixes: []string{
 				"https://acme-v01.api.letsencrypt.org/acme/acct/",
 				"https://acme-v03.api.letsencrypt.org/acme/acct/",
@@ -1196,10 +1514,8 @@ func TestAccountURIMatches(t *testing.T) {
 			want: false,
 		},
 		{
-			name: "three prefixes",
-			params: map[string]string{
-				"accounturi": "https://acme-v02.api.letsencrypt.org/acme/acct/123456",
-			},
+			name:   "three prefixes",
+			params: []caaParameter{{tag: "accounturi", val: "https://acme-v02.api.letsencrypt.org/acme/acct/123456"}},
 			prefixes: []string{
 				"https://acme-v01.api.letsencrypt.org/acme/reg/",
 				"https://acme-v02.api.letsencrypt.org/acme/acct/",
@@ -1209,10 +1525,8 @@ func TestAccountURIMatches(t *testing.T) {
 			want: true,
 		},
 		{
-			name: "multiple prefixes, wrong accountid",
-			params: map[string]string{
-				"accounturi": "https://acme-v02.api.letsencrypt.org/acme/acct/123456",
-			},
+			name:   "multiple prefixes, wrong accountid",
+			params: []caaParameter{{tag: "accounturi", val: "https://acme-v02.api.letsencrypt.org/acme/acct/123456"}},
 			prefixes: []string{
 				"https://acme-v01.api.letsencrypt.org/acme/reg/",
 				"https://acme-v02.api.letsencrypt.org/acme/acct/",
@@ -1224,6 +1538,7 @@ func TestAccountURIMatches(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			got := caaAccountURIMatches(tc.params, tc.prefixes, tc.id)
 			test.AssertEquals(t, got, tc.want)
 		})
@@ -1231,79 +1546,106 @@ func TestAccountURIMatches(t *testing.T) {
 }
 
 func TestValidationMethodMatches(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name   string
-		params map[string]string
+		params []caaParameter
 		method core.AcmeChallenge
 		want   bool
 	}{
 		{
 			name:   "empty validationmethods",
-			params: map[string]string{},
+			params: nil,
 			method: core.ChallengeTypeHTTP01,
 			want:   true,
 		},
 		{
-			name: "only comma",
-			params: map[string]string{
-				"validationmethods": ",",
-			},
-			method: core.ChallengeTypeHTTP01,
-			want:   false,
-		},
-		{
-			name: "malformed method",
-			params: map[string]string{
-				"validationmethods": "howdy !",
-			},
-			method: core.ChallengeTypeHTTP01,
-			want:   false,
-		},
-		{
-			name: "invalid method",
-			params: map[string]string{
-				"validationmethods": "tls-sni-01",
-			},
-			method: core.ChallengeTypeHTTP01,
-			want:   false,
-		},
-		{
-			name: "simple match",
-			params: map[string]string{
-				"validationmethods": "http-01",
-			},
+			name:   "no validationmethods in rr, but other parameters exist", // validationmethods is not mandatory
+			params: []caaParameter{{tag: "accounturi", val: "ph1LwuzHere"}},
 			method: core.ChallengeTypeHTTP01,
 			want:   true,
 		},
 		{
-			name: "simple mismatch",
-			params: map[string]string{
-				"validationmethods": "dns-01",
-			},
+			name:   "no value",
+			params: []caaParameter{{tag: "validationmethods", val: ""}}, // equivalent to forbidding issuance
 			method: core.ChallengeTypeHTTP01,
 			want:   false,
 		},
 		{
-			name: "multiple choices, match first",
-			params: map[string]string{
-				"validationmethods": "http-01,dns-01",
-			},
+			name:   "only comma",
+			params: []caaParameter{{tag: "validationmethods", val: ","}},
+			method: core.ChallengeTypeHTTP01,
+			want:   false,
+		},
+		{
+			name:   "malformed method",
+			params: []caaParameter{{tag: "validationmethods", val: "howdy !"}},
+			method: core.ChallengeTypeHTTP01,
+			want:   false,
+		},
+		{
+			name:   "invalid method",
+			params: []caaParameter{{tag: "validationmethods", val: "tls-sni-01"}},
+			method: core.ChallengeTypeHTTP01,
+			want:   false,
+		},
+		{
+			name:   "simple match",
+			params: []caaParameter{{tag: "validationmethods", val: "http-01"}},
 			method: core.ChallengeTypeHTTP01,
 			want:   true,
 		},
 		{
-			name: "multiple choices, match second",
-			params: map[string]string{
-				"validationmethods": "http-01,dns-01",
-			},
+			name:   "simple match, but has a friend",
+			params: []caaParameter{{tag: "accounturi", val: "https://example.org"}, {tag: "validationmethods", val: "http-01"}},
+			method: core.ChallengeTypeHTTP01,
+			want:   true,
+		},
+		{
+			name:   "multiple validationmethods, each with no value",
+			params: []caaParameter{{tag: "validationmethods", val: ""}, {tag: "validationmethods", val: ""}},
+			method: core.ChallengeTypeHTTP01,
+			want:   false,
+		},
+		{
+			name:   "multiple validationmethods, one with no value",
+			params: []caaParameter{{tag: "validationmethods", val: ""}, {tag: "validationmethods", val: "http-01"}},
+			method: core.ChallengeTypeHTTP01,
+			want:   false,
+		},
+		{
+			name:   "multiple validationmethods, each with an identical value",
+			params: []caaParameter{{tag: "validationmethods", val: "http-01"}, {tag: "validationmethods", val: "http-01"}},
+			method: core.ChallengeTypeHTTP01,
+			want:   false,
+		},
+		{
+			name:   "multiple validationmethods, each with a different value",
+			params: []caaParameter{{tag: "validationmethods", val: "http-01"}, {tag: "validationmethods", val: "dns-01"}},
+			method: core.ChallengeTypeHTTP01,
+			want:   false,
+		},
+		{
+			name:   "simple mismatch",
+			params: []caaParameter{{tag: "validationmethods", val: "dns-01"}},
+			method: core.ChallengeTypeHTTP01,
+			want:   false,
+		},
+		{
+			name:   "multiple choices, match first",
+			params: []caaParameter{{tag: "validationmethods", val: "http-01,dns-01"}},
+			method: core.ChallengeTypeHTTP01,
+			want:   true,
+		},
+		{
+			name:   "multiple choices, match second",
+			params: []caaParameter{{tag: "validationmethods", val: "http-01,dns-01"}},
 			method: core.ChallengeTypeDNS01,
 			want:   true,
 		},
 		{
-			name: "multiple choices, match none",
-			params: map[string]string{
-				"validationmethods": "http-01,dns-01",
-			},
+			name:   "multiple choices, match none",
+			params: []caaParameter{{tag: "validationmethods", val: "http-01,dns-01"}},
 			method: core.ChallengeTypeTLSALPN01,
 			want:   false,
 		},
@@ -1311,6 +1653,7 @@ func TestValidationMethodMatches(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			got := caaValidationMethodMatches(tc.params, tc.method)
 			test.AssertEquals(t, got, tc.want)
 		})
@@ -1318,81 +1661,96 @@ func TestValidationMethodMatches(t *testing.T) {
 }
 
 func TestExtractIssuerDomainAndParameters(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name            string
 		value           string
 		wantDomain      string
-		wantParameters  map[string]string
+		wantParameters  []caaParameter
 		expectErrSubstr string
 	}{
 		{
 			name:            "empty record is valid",
 			value:           "",
 			wantDomain:      "",
-			wantParameters:  map[string]string{},
+			wantParameters:  nil,
 			expectErrSubstr: "",
 		},
 		{
 			name:            "only semicolon is valid",
 			value:           ";",
 			wantDomain:      "",
-			wantParameters:  map[string]string{},
+			wantParameters:  nil,
 			expectErrSubstr: "",
 		},
 		{
 			name:            "only semicolon and whitespace is valid",
 			value:           " ; ",
 			wantDomain:      "",
-			wantParameters:  map[string]string{},
+			wantParameters:  nil,
 			expectErrSubstr: "",
 		},
 		{
 			name:            "only domain is valid",
 			value:           "letsencrypt.org",
 			wantDomain:      "letsencrypt.org",
-			wantParameters:  map[string]string{},
+			wantParameters:  nil,
 			expectErrSubstr: "",
 		},
 		{
 			name:            "only domain with trailing semicolon is valid",
 			value:           "letsencrypt.org;",
 			wantDomain:      "letsencrypt.org",
-			wantParameters:  map[string]string{},
+			wantParameters:  nil,
+			expectErrSubstr: "",
+		},
+		{
+			name:            "only domain with semicolon and trailing whitespace is valid",
+			value:           "letsencrypt.org;   ",
+			wantDomain:      "letsencrypt.org",
+			wantParameters:  nil,
 			expectErrSubstr: "",
 		},
 		{
 			name:            "domain with params and whitespace is valid",
 			value:           "  letsencrypt.org	;foo=bar;baz=bar",
 			wantDomain:      "letsencrypt.org",
-			wantParameters:  map[string]string{"foo": "bar", "baz": "bar"},
+			wantParameters:  []caaParameter{{tag: "foo", val: "bar"}, {tag: "baz", val: "bar"}},
 			expectErrSubstr: "",
 		},
 		{
 			name:            "domain with params and different whitespace is valid",
 			value:           "	letsencrypt.org ;foo=bar;baz=bar",
 			wantDomain:      "letsencrypt.org",
-			wantParameters:  map[string]string{"foo": "bar", "baz": "bar"},
+			wantParameters:  []caaParameter{{tag: "foo", val: "bar"}, {tag: "baz", val: "bar"}},
 			expectErrSubstr: "",
 		},
 		{
 			name:            "empty params are valid",
 			value:           "letsencrypt.org; foo=; baz =	bar",
 			wantDomain:      "letsencrypt.org",
-			wantParameters:  map[string]string{"foo": "", "baz": "bar"},
+			wantParameters:  []caaParameter{{tag: "foo", val: ""}, {tag: "baz", val: "bar"}},
 			expectErrSubstr: "",
 		},
 		{
 			name:            "whitespace around params is valid",
 			value:           "letsencrypt.org; foo=	; baz =	bar",
 			wantDomain:      "letsencrypt.org",
-			wantParameters:  map[string]string{"foo": "", "baz": "bar"},
+			wantParameters:  []caaParameter{{tag: "foo", val: ""}, {tag: "baz", val: "bar"}},
 			expectErrSubstr: "",
 		},
 		{
 			name:            "comma-separated param values are valid",
 			value:           "letsencrypt.org; foo=b1,b2,b3	; baz =		a=b	",
 			wantDomain:      "letsencrypt.org",
-			wantParameters:  map[string]string{"foo": "b1,b2,b3", "baz": "a=b"},
+			wantParameters:  []caaParameter{{tag: "foo", val: "b1,b2,b3"}, {tag: "baz", val: "a=b"}},
+			expectErrSubstr: "",
+		},
+		{
+			name:            "duplicate tags are valid",
+			value:           "letsencrypt.org; foo=b1,b2,b3	; foo= b1,b2,b3	",
+			wantDomain:      "letsencrypt.org",
+			wantParameters:  []caaParameter{{tag: "foo", val: "b1,b2,b3"}, {tag: "foo", val: "b1,b2,b3"}},
 			expectErrSubstr: "",
 		},
 		{
@@ -1414,7 +1772,7 @@ func TestExtractIssuerDomainAndParameters(t *testing.T) {
 			name:            "hyphens in param values are valid",
 			value:           "letsencrypt.org; 1=2; baz=a-b",
 			wantDomain:      "letsencrypt.org",
-			wantParameters:  map[string]string{"1": "2", "baz": "a-b"},
+			wantParameters:  []caaParameter{{tag: "1", val: "2"}, {tag: "baz", val: "a-b"}},
 			expectErrSubstr: "",
 		},
 		{
@@ -1445,6 +1803,7 @@ func TestExtractIssuerDomainAndParameters(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			gotDomain, gotParameters, gotErr := parseCAARecord(&dns.CAA{Value: tc.value})
 
 			if tc.expectErrSubstr == "" {

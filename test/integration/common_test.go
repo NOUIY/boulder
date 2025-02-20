@@ -89,7 +89,7 @@ func delHTTP01Response(token string) error {
 	return nil
 }
 
-func makeClientAndOrder(c *client, csrKey *ecdsa.PrivateKey, domains []string, cn bool) (*client, *acme.Order, error) {
+func makeClientAndOrder(c *client, csrKey *ecdsa.PrivateKey, domains []string, cn bool, profile string, certToReplace *x509.Certificate) (*client, *acme.Order, error) {
 	var err error
 	if c == nil {
 		c, err = makeClient()
@@ -102,7 +102,12 @@ func makeClientAndOrder(c *client, csrKey *ecdsa.PrivateKey, domains []string, c
 	for _, domain := range domains {
 		ids = append(ids, acme.Identifier{Type: "dns", Value: domain})
 	}
-	order, err := c.Client.NewOrder(c.Account, ids)
+	var order acme.Order
+	if certToReplace != nil {
+		order, err = c.Client.ReplacementOrderExtension(c.Account, certToReplace, ids, acme.OrderExtension{Profile: profile})
+	} else {
+		order, err = c.Client.NewOrderExtension(c.Account, ids, acme.OrderExtension{Profile: profile})
+	}
 	if err != nil {
 		return nil, nil, err
 	}
@@ -148,10 +153,10 @@ type issuanceResult struct {
 	certs []*x509.Certificate
 }
 
-func authAndIssue(c *client, csrKey *ecdsa.PrivateKey, domains []string, cn bool) (*issuanceResult, error) {
+func authAndIssue(c *client, csrKey *ecdsa.PrivateKey, domains []string, cn bool, profile string) (*issuanceResult, error) {
 	var err error
 
-	c, order, err := makeClientAndOrder(c, csrKey, domains, cn)
+	c, order, err := makeClientAndOrder(c, csrKey, domains, cn, profile, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -169,7 +174,7 @@ type issuanceResultAllChains struct {
 }
 
 func authAndIssueFetchAllChains(c *client, csrKey *ecdsa.PrivateKey, domains []string, cn bool) (*issuanceResultAllChains, error) {
-	c, order, err := makeClientAndOrder(c, csrKey, domains, cn)
+	c, order, err := makeClientAndOrder(c, csrKey, domains, cn, "", nil)
 	if err != nil {
 		return nil, err
 	}

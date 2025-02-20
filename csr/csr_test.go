@@ -20,16 +20,10 @@ import (
 	"github.com/letsencrypt/boulder/test"
 )
 
-var testingPolicy = &goodkey.KeyPolicy{
-	AllowRSA:           true,
-	AllowECDSANISTP256: true,
-	AllowECDSANISTP384: true,
-}
-
 type mockPA struct{}
 
-func (pa *mockPA) ChallengesFor(identifier identifier.ACMEIdentifier) (challenges []core.Challenge, err error) {
-	return
+func (pa *mockPA) ChallengeTypesFor(identifier identifier.ACMEIdentifier) ([]core.AcmeChallenge, error) {
+	return []core.AcmeChallenge{}, nil
 }
 
 func (pa *mockPA) WillingToIssue(domains []string) error {
@@ -45,7 +39,7 @@ func (pa *mockPA) ChallengeTypeEnabled(t core.AcmeChallenge) bool {
 	return true
 }
 
-func (pa *mockPA) CheckAuthz(a *core.Authorization) error {
+func (pa *mockPA) CheckAuthzChallenges(a *core.Authorization) error {
 	return nil
 }
 
@@ -78,87 +72,79 @@ func TestVerifyCSR(t *testing.T) {
 	*signedReqWithAllLongSANs = *signedReq
 	signedReqWithAllLongSANs.DNSNames = []string{"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.com"}
 
+	keyPolicy, err := goodkey.NewPolicy(nil, nil)
+	test.AssertNotError(t, err, "creating test keypolicy")
+
 	cases := []struct {
 		csr           *x509.CertificateRequest
 		maxNames      int
-		keyPolicy     *goodkey.KeyPolicy
 		pa            core.PolicyAuthority
 		expectedError error
 	}{
 		{
 			&x509.CertificateRequest{},
 			100,
-			testingPolicy,
 			&mockPA{},
 			invalidPubKey,
 		},
 		{
 			&x509.CertificateRequest{PublicKey: &private.PublicKey},
 			100,
-			testingPolicy,
 			&mockPA{},
 			unsupportedSigAlg,
 		},
 		{
 			brokenSignedReq,
 			100,
-			testingPolicy,
 			&mockPA{},
 			invalidSig,
 		},
 		{
 			signedReq,
 			100,
-			testingPolicy,
 			&mockPA{},
 			invalidNoDNS,
 		},
 		{
 			signedReqWithLongCN,
 			100,
-			testingPolicy,
 			&mockPA{},
-			berrors.BadCSRError("CN was longer than %d bytes", maxCNLength),
+			nil,
 		},
 		{
 			signedReqWithHosts,
 			1,
-			testingPolicy,
 			&mockPA{},
 			berrors.BadCSRError("CSR contains more than 1 DNS names"),
 		},
 		{
 			signedReqWithBadNames,
 			100,
-			testingPolicy,
 			&mockPA{},
 			errors.New("policy forbids issuing for identifier"),
 		},
 		{
 			signedReqWithEmailAddress,
 			100,
-			testingPolicy,
 			&mockPA{},
 			invalidEmailPresent,
 		},
 		{
 			signedReqWithIPAddress,
 			100,
-			testingPolicy,
 			&mockPA{},
 			invalidIPPresent,
 		},
 		{
 			signedReqWithAllLongSANs,
 			100,
-			testingPolicy,
 			&mockPA{},
 			nil,
 		},
 	}
 
 	for _, c := range cases {
-		err := VerifyCSR(context.Background(), c.csr, c.maxNames, c.keyPolicy, c.pa)
+		err := VerifyCSR(context.Background(), c.csr, c.maxNames, &keyPolicy, c.pa)
 		test.AssertDeepEquals(t, c.expectedError, err)
 	}
 }
@@ -203,7 +189,16 @@ func TestNamesFromCSR(t *testing.T) {
 			[]string{"a.com", "b.com"},
 		},
 		{
-			"no explicit CN, too long leading SANs",
+			"no explicit CN, all SANs too long to be the CN",
+			&x509.CertificateRequest{DNSNames: []string{
+				tooLongString + ".a.com",
+				tooLongString + ".b.com",
+			}},
+			"",
+			[]string{tooLongString + ".a.com", tooLongString + ".b.com"},
+		},
+		{
+			"no explicit CN, leading SANs too long to be the CN",
 			&x509.CertificateRequest{DNSNames: []string{
 				tooLongString + ".a.com",
 				tooLongString + ".b.com",
@@ -214,7 +209,7 @@ func TestNamesFromCSR(t *testing.T) {
 			[]string{"a.com", tooLongString + ".a.com", tooLongString + ".b.com", "b.com"},
 		},
 		{
-			"explicit CN, too long leading SANs",
+			"explicit CN, leading SANs too long to be the CN",
 			&x509.CertificateRequest{
 				Subject: pkix.Name{CommonName: "A.com"},
 				DNSNames: []string{
@@ -225,6 +220,24 @@ func TestNamesFromCSR(t *testing.T) {
 				}},
 			"a.com",
 			[]string{"a.com", tooLongString + ".a.com", tooLongString + ".b.com", "b.com"},
+		},
+		{
+			"explicit CN that's too long to be the CN",
+			&x509.CertificateRequest{
+				Subject: pkix.Name{CommonName: tooLongString + ".a.com"},
+			},
+			"",
+			[]string{tooLongString + ".a.com"},
+		},
+		{
+			"explicit CN that's too long to be the CN, with a SAN",
+			&x509.CertificateRequest{
+				Subject: pkix.Name{CommonName: tooLongString + ".a.com"},
+				DNSNames: []string{
+					"b.com",
+				}},
+			"",
+			[]string{tooLongString + ".a.com", "b.com"},
 		},
 	}
 	for _, tc := range cases {
@@ -238,6 +251,9 @@ func TestNamesFromCSR(t *testing.T) {
 
 func TestSHA1Deprecation(t *testing.T) {
 	features.Reset()
+
+	keyPolicy, err := goodkey.NewPolicy(nil, nil)
+	test.AssertNotError(t, err, "creating test keypolicy")
 
 	private, err := rsa.GenerateKey(rand.Reader, 2048)
 	test.AssertNotError(t, err, "error generating test key")
@@ -254,7 +270,7 @@ func TestSHA1Deprecation(t *testing.T) {
 		csr, err := x509.ParseCertificateRequest(csrBytes)
 		test.AssertNotError(t, err, "parsing test CSR")
 
-		return VerifyCSR(context.Background(), csr, 100, testingPolicy, &mockPA{})
+		return VerifyCSR(context.Background(), csr, 100, &keyPolicy, &mockPA{})
 	}
 
 	err = makeAndVerifyCsr(x509.SHA256WithRSA)

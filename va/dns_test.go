@@ -4,44 +4,42 @@ import (
 	"context"
 	"fmt"
 	"net"
-	"strings"
 	"testing"
 	"time"
 
 	"github.com/jmhodges/clock"
+	"github.com/prometheus/client_golang/prometheus"
+
 	"github.com/letsencrypt/boulder/bdns"
 	"github.com/letsencrypt/boulder/core"
 	"github.com/letsencrypt/boulder/identifier"
 	"github.com/letsencrypt/boulder/metrics"
 	"github.com/letsencrypt/boulder/probs"
 	"github.com/letsencrypt/boulder/test"
-	"github.com/prometheus/client_golang/prometheus"
 )
 
-func dnsChallenge() core.Challenge {
-	return createChallenge(core.ChallengeTypeDNS01)
-}
-
 func TestDNSValidationEmpty(t *testing.T) {
-	va, _ := setup(nil, 0, "", nil, nil)
+	va, _ := setup(nil, "", nil, nil)
 
 	// This test calls PerformValidation directly, because that is where the
 	// metrics checked below are incremented.
 	req := createValidationRequest("empty-txts.com", core.ChallengeTypeDNS01)
 	res, _ := va.PerformValidation(context.Background(), req)
-	test.AssertEquals(t, res.Problems.ProblemType, "unauthorized")
-	test.AssertEquals(t, res.Problems.Detail, "No TXT record found at _acme-challenge.empty-txts.com")
+	test.AssertEquals(t, res.Problem.ProblemType, "unauthorized")
+	test.AssertEquals(t, res.Problem.Detail, "No TXT record found at _acme-challenge.empty-txts.com")
 
-	test.AssertMetricWithLabelsEquals(t, va.metrics.validationTime, prometheus.Labels{
-		"type":         "dns-01",
-		"result":       "invalid",
-		"problem_type": "unauthorized",
+	test.AssertMetricWithLabelsEquals(t, va.metrics.validationLatency, prometheus.Labels{
+		"operation":      opDCVAndCAA,
+		"perspective":    va.perspective,
+		"challenge_type": string(core.ChallengeTypeDNS01),
+		"problem_type":   string(probs.UnauthorizedProblem),
+		"result":         fail,
 	}, 1)
 }
 
 func TestDNSValidationWrong(t *testing.T) {
-	va, _ := setup(nil, 0, "", nil, nil)
-	_, err := va.validateDNS01(context.Background(), dnsi("wrong-dns01.com"), dnsChallenge())
+	va, _ := setup(nil, "", nil, nil)
+	_, err := va.validateDNS01(context.Background(), dnsi("wrong-dns01.com"), expectedKeyAuthorization)
 	if err == nil {
 		t.Fatalf("Successful DNS validation with wrong TXT record")
 	}
@@ -50,9 +48,9 @@ func TestDNSValidationWrong(t *testing.T) {
 }
 
 func TestDNSValidationWrongMany(t *testing.T) {
-	va, _ := setup(nil, 0, "", nil, nil)
+	va, _ := setup(nil, "", nil, nil)
 
-	_, err := va.validateDNS01(context.Background(), dnsi("wrong-many-dns01.com"), dnsChallenge())
+	_, err := va.validateDNS01(context.Background(), dnsi("wrong-many-dns01.com"), expectedKeyAuthorization)
 	if err == nil {
 		t.Fatalf("Successful DNS validation with wrong TXT record")
 	}
@@ -61,9 +59,9 @@ func TestDNSValidationWrongMany(t *testing.T) {
 }
 
 func TestDNSValidationWrongLong(t *testing.T) {
-	va, _ := setup(nil, 0, "", nil, nil)
+	va, _ := setup(nil, "", nil, nil)
 
-	_, err := va.validateDNS01(context.Background(), dnsi("long-dns01.com"), dnsChallenge())
+	_, err := va.validateDNS01(context.Background(), dnsi("long-dns01.com"), expectedKeyAuthorization)
 	if err == nil {
 		t.Fatalf("Successful DNS validation with wrong TXT record")
 	}
@@ -72,9 +70,9 @@ func TestDNSValidationWrongLong(t *testing.T) {
 }
 
 func TestDNSValidationFailure(t *testing.T) {
-	va, _ := setup(nil, 0, "", nil, nil)
+	va, _ := setup(nil, "", nil, nil)
 
-	_, err := va.validateDNS01(ctx, dnsi("localhost"), dnsChallenge())
+	_, err := va.validateDNS01(ctx, dnsi("localhost"), expectedKeyAuthorization)
 	prob := detailedError(err)
 
 	test.AssertEquals(t, prob.Type, probs.UnauthorizedProblem)
@@ -86,64 +84,25 @@ func TestDNSValidationInvalid(t *testing.T) {
 		Value: "790DB180-A274-47A4-855F-31C428CB1072",
 	}
 
-	va, _ := setup(nil, 0, "", nil, nil)
+	va, _ := setup(nil, "", nil, nil)
 
-	_, err := va.validateDNS01(ctx, notDNS, dnsChallenge())
+	_, err := va.validateDNS01(ctx, notDNS, expectedKeyAuthorization)
 	prob := detailedError(err)
 
 	test.AssertEquals(t, prob.Type, probs.MalformedProblem)
 }
 
-func TestDNSValidationNotSane(t *testing.T) {
-	va, _ := setup(nil, 0, "", nil, nil)
-
-	chall := dnsChallenge()
-	chall.Token = ""
-	_, err := va.validateChallenge(ctx, dnsi("localhost"), chall)
-	prob := detailedError(err)
-	if prob.Type != probs.MalformedProblem {
-		t.Errorf("Got wrong error type: expected %s, got %s",
-			prob.Type, probs.MalformedProblem)
-	}
-	if !strings.Contains(prob.Error(), "Challenge failed consistency check:") {
-		t.Errorf("Got wrong error: %s", prob.Error())
-	}
-
-	chall.Token = "yfCBb-bRTLz8Wd1C0lTUQK3qlKj3-t2tYGwx5Hj7r_"
-	_, err = va.validateChallenge(ctx, dnsi("localhost"), chall)
-	prob = detailedError(err)
-	if prob.Type != probs.MalformedProblem {
-		t.Errorf("Got wrong error type: expected %s, got %s",
-			prob.Type, probs.MalformedProblem)
-	}
-	if !strings.Contains(prob.Error(), "Challenge failed consistency check:") {
-		t.Errorf("Got wrong error: %s", prob.Error())
-	}
-
-	chall.ProvidedKeyAuthorization = "a"
-	_, err = va.validateChallenge(ctx, dnsi("localhost"), chall)
-	prob = detailedError(err)
-	if prob.Type != probs.MalformedProblem {
-		t.Errorf("Got wrong error type: expected %s, got %s",
-			prob.Type, probs.MalformedProblem)
-	}
-	if !strings.Contains(prob.Error(), "Challenge failed consistency check:") {
-		t.Errorf("Got wrong error: %s", prob.Error())
-	}
-
-}
-
 func TestDNSValidationServFail(t *testing.T) {
-	va, _ := setup(nil, 0, "", nil, nil)
+	va, _ := setup(nil, "", nil, nil)
 
-	_, err := va.validateChallenge(ctx, dnsi("servfail.com"), dnsChallenge())
+	_, err := va.validateDNS01(ctx, dnsi("servfail.com"), expectedKeyAuthorization)
 
 	prob := detailedError(err)
 	test.AssertEquals(t, prob.Type, probs.DNSProblem)
 }
 
 func TestDNSValidationNoServer(t *testing.T) {
-	va, log := setup(nil, 0, "", nil, nil)
+	va, log := setup(nil, "", nil, nil)
 	staticProvider, err := bdns.NewStaticProvider([]string{})
 	test.AssertNotError(t, err, "Couldn't make new static provider")
 
@@ -156,23 +115,23 @@ func TestDNSValidationNoServer(t *testing.T) {
 		log,
 		nil)
 
-	_, err = va.validateChallenge(ctx, dnsi("localhost"), dnsChallenge())
+	_, err = va.validateDNS01(ctx, dnsi("localhost"), expectedKeyAuthorization)
 	prob := detailedError(err)
 	test.AssertEquals(t, prob.Type, probs.DNSProblem)
 }
 
 func TestDNSValidationOK(t *testing.T) {
-	va, _ := setup(nil, 0, "", nil, nil)
+	va, _ := setup(nil, "", nil, nil)
 
-	_, prob := va.validateChallenge(ctx, dnsi("good-dns01.com"), dnsChallenge())
+	_, prob := va.validateDNS01(ctx, dnsi("good-dns01.com"), expectedKeyAuthorization)
 
 	test.Assert(t, prob == nil, "Should be valid.")
 }
 
 func TestDNSValidationNoAuthorityOK(t *testing.T) {
-	va, _ := setup(nil, 0, "", nil, nil)
+	va, _ := setup(nil, "", nil, nil)
 
-	_, prob := va.validateChallenge(ctx, dnsi("no-authority-dns01.com"), dnsChallenge())
+	_, prob := va.validateDNS01(ctx, dnsi("no-authority-dns01.com"), expectedKeyAuthorization)
 
 	test.Assert(t, prob == nil, "Should be valid.")
 }

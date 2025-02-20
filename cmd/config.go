@@ -3,6 +3,7 @@ package cmd
 import (
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net"
@@ -124,14 +125,18 @@ type HostnamePolicyConfig struct {
 
 // TLSConfig represents certificates and a key for authenticated TLS.
 type TLSConfig struct {
-	CertFile   string `validate:"required"`
-	KeyFile    string `validate:"required"`
+	CertFile string `validate:"required"`
+	KeyFile  string `validate:"required"`
+	// The CACertFile file may contain any number of root certificates and will
+	// be deduplicated internally.
 	CACertFile string `validate:"required"`
 }
 
 // Load reads and parses the certificates and key listed in the TLSConfig, and
-// returns a *tls.Config suitable for either client or server use. Prometheus
-// metrics for various certificate fields will be exported.
+// returns a *tls.Config suitable for either client or server use. The
+// CACertFile file may contain any number of root certificates and will be
+// deduplicated internally. Prometheus metrics for various certificate fields
+// will be exported.
 func (t *TLSConfig) Load(scope prometheus.Registerer) (*tls.Config, error) {
 	if t == nil {
 		return nil, fmt.Errorf("nil TLS section in config")
@@ -205,11 +210,8 @@ func (t *TLSConfig) Load(scope prometheus.Registerer) (*tls.Config, error) {
 		ClientCAs:    rootCAs,
 		ClientAuth:   tls.RequireAndVerifyClientCert,
 		Certificates: []tls.Certificate{cert},
-		// Set the only acceptable TLS to v1.2 and v1.3.
-		MinVersion: tls.VersionTLS12,
-		MaxVersion: tls.VersionTLS13,
-		// CipherSuites will be ignored for TLS v1.3.
-		CipherSuites: []uint16{tls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305},
+		// Set the only acceptable TLS to v1.3.
+		MinVersion: tls.VersionTLS13,
 	}, nil
 }
 
@@ -551,4 +553,34 @@ type DNSProvider struct {
 	// 1 1 8053 0a4d4d4d.addr.dc1.consul.
 	// 1 1 8153 0a4d4d4d.addr.dc1.consul.
 	SRVLookup ServiceDomain `validate:"required"`
+}
+
+// HMACKeyConfig specifies a path to a file containing a hexadecimal-encoded
+// HMAC key. The key must represent exactly 256 bits (32 bytes) of random data
+// to be suitable for use as a 256-bit hashing key (e.g., the output of `openssl
+// rand -hex 32`).
+type HMACKeyConfig struct {
+	KeyFile string `validate:"required"`
+}
+
+// Load reads the HMAC key from the file, decodes it from hexadecimal, ensures
+// it represents exactly 256 bits (32 bytes), and returns it as a byte slice.
+func (hc *HMACKeyConfig) Load() ([]byte, error) {
+	contents, err := os.ReadFile(hc.KeyFile)
+	if err != nil {
+		return nil, err
+	}
+
+	decoded, err := hex.DecodeString(strings.TrimSpace(string(contents)))
+	if err != nil {
+		return nil, fmt.Errorf("invalid hexadecimal encoding: %w", err)
+	}
+
+	if len(decoded) != 32 {
+		return nil, fmt.Errorf(
+			"validating HMAC key, must be exactly 256 bits (32 bytes) after decoding, got %d",
+			len(decoded),
+		)
+	}
+	return decoded, nil
 }

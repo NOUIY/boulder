@@ -1,31 +1,30 @@
 package main
 
 import (
-	"bytes"
 	"crypto"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
-	"crypto/sha1"
 	"crypto/sha256"
 	"crypto/x509"
 	"encoding/base64"
-	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
-	mrand "math/rand"
+	mrand "math/rand/v2"
 	"net/http"
 	"time"
+
+	"github.com/go-jose/go-jose/v4"
+	"golang.org/x/crypto/ocsp"
 
 	"github.com/letsencrypt/boulder/core"
 	"github.com/letsencrypt/boulder/identifier"
 	"github.com/letsencrypt/boulder/probs"
 	"github.com/letsencrypt/boulder/test/load-generator/acme"
-	"golang.org/x/crypto/ocsp"
-	"gopkg.in/go-jose/go-jose.v2"
 )
 
 var (
@@ -71,7 +70,7 @@ func getAccount(s *State, c *acmeCache) error {
 	}
 
 	// Select a random account from the state and put it into the context
-	c.acct = s.accts[mrand.Intn(len(s.accts))]
+	c.acct = s.accts[mrand.IntN(len(s.accts))]
 	c.ns = &nonceSource{s: s}
 	return nil
 }
@@ -152,10 +151,9 @@ func newAccount(s *State, c *acmeCache) error {
 func randDomain(base string) string {
 	// This approach will cause some repeat domains but not enough to make rate
 	// limits annoying!
-	n := time.Now().UnixNano()
-	b := new(bytes.Buffer)
-	binary.Write(b, binary.LittleEndian, n)
-	return fmt.Sprintf("%x.%s", sha1.Sum(b.Bytes()), base)
+	var bytes [3]byte
+	_, _ = rand.Read(bytes[:])
+	return hex.EncodeToString(bytes[:]) + base
 }
 
 // newOrder creates a new pending order object for a random set of domains using
@@ -163,15 +161,12 @@ func randDomain(base string) string {
 func newOrder(s *State, c *acmeCache) error {
 	// Pick a random number of names within the constraints of the maxNamesPerCert
 	// parameter
-	orderSize := 1 + mrand.Intn(s.maxNamesPerCert-1)
+	orderSize := 1 + mrand.IntN(s.maxNamesPerCert-1)
 	// Generate that many random domain names. There may be some duplicates, we
 	// don't care. The ACME server will collapse those down for us, how handy!
 	dnsNames := []identifier.ACMEIdentifier{}
-	for i := 0; i <= orderSize; i++ {
-		dnsNames = append(dnsNames, identifier.ACMEIdentifier{
-			Type:  identifier.DNS,
-			Value: randDomain(s.domainBase),
-		})
+	for range orderSize {
+		dnsNames = append(dnsNames, identifier.NewDNS(randDomain(s.domainBase)))
 	}
 
 	// create the new order request object
@@ -230,7 +225,7 @@ func newOrder(s *State, c *acmeCache) error {
 // popPendingOrder *removes* a random pendingOrder from the context, returning
 // it.
 func popPendingOrder(c *acmeCache) *OrderJSON {
-	orderIndex := mrand.Intn(len(c.pendingOrders))
+	orderIndex := mrand.IntN(len(c.pendingOrders))
 	order := c.pendingOrders[orderIndex]
 	c.pendingOrders = append(c.pendingOrders[:orderIndex], c.pendingOrders[orderIndex+1:]...)
 	return order
@@ -353,7 +348,7 @@ func completeAuthorization(authz *core.Authorization, s *State, c *acmeCache) er
 // then the authorization is valid and ready.
 func pollAuthorization(authz *core.Authorization, s *State, c *acmeCache) error {
 	authzURL := authz.ID
-	for i := 0; i < 3; i++ {
+	for range 3 {
 		// Fetch the authz by its URL
 		authz, err := getAuthorization(s, c, authzURL)
 		if err != nil {
@@ -441,7 +436,7 @@ func getOrder(s *State, c *acmeCache, url string) (*OrderJSON, error) {
 // made to check the order status, sleeping 3s between each. If these attempts
 // expire without the status becoming valid an error is returned.
 func pollOrderForCert(order *OrderJSON, s *State, c *acmeCache) (*OrderJSON, error) {
-	for i := 0; i < 3; i++ {
+	for range 3 {
 		// Fetch the order by its URL
 		order, err := getOrder(s, c, order.URL)
 		if err != nil {
@@ -464,7 +459,7 @@ func pollOrderForCert(order *OrderJSON, s *State, c *acmeCache) (*OrderJSON, err
 // popFulfilledOrder **removes** a fulfilled order from the context, returning
 // it. Fulfilled orders have all of their authorizations satisfied.
 func popFulfilledOrder(c *acmeCache) string {
-	orderIndex := mrand.Intn(len(c.fulfilledOrders))
+	orderIndex := mrand.IntN(len(c.fulfilledOrders))
 	order := c.fulfilledOrders[orderIndex]
 	c.fulfilledOrders = append(c.fulfilledOrders[:orderIndex], c.fulfilledOrders[orderIndex+1:]...)
 	return order
@@ -579,7 +574,7 @@ func postAsGet(s *State, c *acmeCache, url string, latencyTag string) (*http.Res
 }
 
 func popCertificate(c *acmeCache) string {
-	certIndex := mrand.Intn(len(c.certs))
+	certIndex := mrand.IntN(len(c.certs))
 	certURL := c.certs[certIndex]
 	c.certs = append(c.certs[:certIndex], c.certs[certIndex+1:]...)
 	return certURL

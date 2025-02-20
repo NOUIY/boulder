@@ -15,7 +15,7 @@ import (
 	"errors"
 	"log"
 	"math/big"
-	mrand "math/rand"
+	mrand "math/rand/v2"
 	"os"
 	"slices"
 	"sort"
@@ -29,7 +29,6 @@ import (
 
 	"github.com/letsencrypt/boulder/core"
 	"github.com/letsencrypt/boulder/ctpolicy/loglist"
-	"github.com/letsencrypt/boulder/features"
 	"github.com/letsencrypt/boulder/goodkey"
 	"github.com/letsencrypt/boulder/goodkey/sagoodkey"
 	blog "github.com/letsencrypt/boulder/log"
@@ -60,7 +59,7 @@ func init() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	kp, err = sagoodkey.NewKeyPolicy(&goodkey.Config{FermatRounds: 100}, nil)
+	kp, err = sagoodkey.NewPolicy(nil, nil)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -68,7 +67,7 @@ func init() {
 
 func BenchmarkCheckCert(b *testing.B) {
 	checker := newChecker(nil, clock.New(), pa, kp, time.Hour, testValidityDurations, blog.NewMock())
-	testKey, _ := rsa.GenerateKey(rand.Reader, 1024)
+	testKey, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	expiry := time.Now().AddDate(0, 0, 1)
 	serial := big.NewInt(1337)
 	rawCert := x509.Certificate{
@@ -88,7 +87,7 @@ func BenchmarkCheckCert(b *testing.B) {
 		Expires: expiry,
 	}
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for range b.N {
 		checker.checkCert(context.Background(), cert, nil)
 	}
 }
@@ -135,7 +134,7 @@ func TestCheckWildcardCert(t *testing.T) {
 	}
 	_, problems := checker.checkCert(context.Background(), cert, nil)
 	for _, p := range problems {
-		t.Errorf(p)
+		t.Error(p)
 	}
 }
 
@@ -292,7 +291,7 @@ func TestCheckCert(t *testing.T) {
 				delete(problemsMap, p)
 			}
 			for k := range problemsMap {
-				t.Errorf("Expected problem but didn't find it: '%s'.", k)
+				t.Errorf("Expected problem but didn't find '%s' in problems: %q.", k, problems)
 			}
 
 			// Same settings as above, but the stored serial number in the DB is invalid.
@@ -342,7 +341,7 @@ func TestGetAndProcessCerts(t *testing.T) {
 		saCleanUp()
 	}()
 
-	testKey, _ := rsa.GenerateKey(rand.Reader, 1024)
+	testKey, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	// Problems
 	//   Expiry period is too long
 	rawCert := x509.Certificate{
@@ -355,8 +354,8 @@ func TestGetAndProcessCerts(t *testing.T) {
 	}
 	reg := satest.CreateWorkingRegistration(t, isa.SA{Impl: sa})
 	test.AssertNotError(t, err, "Couldn't create registration")
-	for i := int64(0); i < 5; i++ {
-		rawCert.SerialNumber = big.NewInt(mrand.Int63())
+	for range 5 {
+		rawCert.SerialNumber = big.NewInt(mrand.Int64())
 		certDER, err := x509.CreateCertificate(rand.Reader, &rawCert, &rawCert, &testKey.PublicKey, testKey)
 		test.AssertNotError(t, err, "Couldn't create certificate")
 		_, err = sa.AddCertificate(context.Background(), &sapb.AddCertificateRequest{
@@ -632,11 +631,11 @@ func TestIgnoredLint(t *testing.T) {
 		Expires: subjectCert.NotAfter,
 	}
 
-	// Without any ignored lints we expect one error level result due to the
-	// missing OCSP url in the template.
+	// Without any ignored lints we expect several errors and warnings about SCTs,
+	// the common name, and the subject key identifier extension.
 	expectedProblems := []string{
-		"zlint error: e_sub_cert_aia_does_not_contain_ocsp_url",
 		"zlint warn: w_subject_common_name_included",
+		"zlint warn: w_ext_subject_key_identifier_not_recommended_subscriber",
 		"zlint info: w_ct_sct_policy_count_unsatisfied Certificate had 0 embedded SCTs. Browser policy may require 2 for this certificate.",
 		"zlint error: e_scts_from_same_operator Certificate had too few embedded SCTs; browser policy requires 2.",
 	}
@@ -651,16 +650,15 @@ func TestIgnoredLint(t *testing.T) {
 	// Check the certificate again with an ignore map that excludes the affected
 	// lints. This should return no problems.
 	_, problems = checker.checkCert(context.Background(), cert, map[string]bool{
-		"e_sub_cert_aia_does_not_contain_ocsp_url": true,
-		"w_subject_common_name_included":           true,
-		"w_ct_sct_policy_count_unsatisfied":        true,
-		"e_scts_from_same_operator":                true,
+		"w_subject_common_name_included":                          true,
+		"w_ext_subject_key_identifier_not_recommended_subscriber": true,
+		"w_ct_sct_policy_count_unsatisfied":                       true,
+		"e_scts_from_same_operator":                               true,
 	})
 	test.AssertEquals(t, len(problems), 0)
 }
 
 func TestPrecertCorrespond(t *testing.T) {
-	features.Set(features.Config{CertCheckerRequiresCorrespondence: true})
 	checker := newChecker(nil, clock.New(), pa, kp, time.Hour, testValidityDurations, blog.NewMock())
 	checker.getPrecert = func(_ context.Context, _ string) ([]byte, error) {
 		return []byte("hello"), nil

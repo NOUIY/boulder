@@ -8,7 +8,6 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"log/syslog"
 	"os"
 	"regexp"
 	"slices"
@@ -313,7 +312,7 @@ func (c *certChecker) checkValidations(ctx context.Context, cert core.Certificat
 	// Any authorization for a given name is sufficient.
 	nameToAuthz := make(map[string]*corepb.Authorization)
 	for _, m := range authzs {
-		nameToAuthz[m.Identifier] = m
+		nameToAuthz[m.DnsName] = m
 	}
 
 	var errors []error
@@ -423,7 +422,9 @@ func (c *certChecker) checkCert(ctx context.Context, cert core.Certificate, igno
 			}
 		}
 		// Check the cert has the correct key usage extensions
-		if !slices.Equal(parsedCert.ExtKeyUsage, []zX509.ExtKeyUsage{zX509.ExtKeyUsageServerAuth, zX509.ExtKeyUsageClientAuth}) {
+		serverAndClient := slices.Equal(parsedCert.ExtKeyUsage, []zX509.ExtKeyUsage{zX509.ExtKeyUsageServerAuth, zX509.ExtKeyUsageClientAuth})
+		serverOnly := slices.Equal(parsedCert.ExtKeyUsage, []zX509.ExtKeyUsage{zX509.ExtKeyUsageServerAuth})
+		if !(serverAndClient || serverOnly) {
 			problems = append(problems, "Certificate has incorrect key usage extensions")
 		}
 
@@ -453,19 +454,17 @@ func (c *certChecker) checkCert(ctx context.Context, cert core.Certificate, igno
 			problems = append(problems, fmt.Sprintf("Key Policy isn't willing to issue for public key: %s", err))
 		}
 
-		if features.Get().CertCheckerRequiresCorrespondence {
-			precertDER, err := c.getPrecert(ctx, cert.Serial)
+		precertDER, err := c.getPrecert(ctx, cert.Serial)
+		if err != nil {
+			// Log and continue, since we want the problems slice to only contains
+			// problems with the cert itself.
+			c.logger.Errf("fetching linting precertificate for %s: %s", cert.Serial, err)
+			atomic.AddInt64(&c.issuedReport.DbErrs, 1)
+		} else {
+			err = precert.Correspond(precertDER, cert.DER)
 			if err != nil {
-				// Log and continue, since we want the problems slice to only contains
-				// problems with the cert itself.
-				c.logger.Errf("fetching linting precertificate for %s: %s", cert.Serial, err)
-				atomic.AddInt64(&c.issuedReport.DbErrs, 1)
-			} else {
-				err = precert.Correspond(precertDER, cert.DER)
-				if err != nil {
-					problems = append(problems,
-						fmt.Sprintf("Certificate does not correspond to precert for %s: %s", cert.Serial, err))
-				}
+				problems = append(problems,
+					fmt.Sprintf("Certificate does not correspond to precert for %s: %s", cert.Serial, err))
 			}
 		}
 
@@ -532,19 +531,7 @@ func main() {
 
 	features.Set(config.CertChecker.Features)
 
-	syslogger, err := syslog.Dial("", "", syslog.LOG_INFO|syslog.LOG_LOCAL0, "")
-	cmd.FailOnError(err, "Failed to dial syslog")
-
-	syslogLevel := int(syslog.LOG_INFO)
-	if config.Syslog.SyslogLevel != 0 {
-		syslogLevel = config.Syslog.SyslogLevel
-	}
-	logger, err := blog.New(syslogger, config.Syslog.StdoutLevel, syslogLevel)
-	cmd.FailOnError(err, "Could not connect to Syslog")
-
-	err = blog.Set(logger)
-	cmd.FailOnError(err, "Failed to set audit logger")
-
+	logger := cmd.NewLogger(config.Syslog)
 	logger.Info(cmd.VersionString())
 
 	acceptableValidityDurations := make(map[time.Duration]bool)
@@ -562,13 +549,7 @@ func main() {
 	// Validate PA config and set defaults if needed.
 	cmd.FailOnError(config.PA.CheckChallenges(), "Invalid PA configuration")
 
-	if config.CertChecker.GoodKey.WeakKeyFile != "" {
-		cmd.Fail("cert-checker does not support checking against weak key files")
-	}
-	if config.CertChecker.GoodKey.BlockedKeyFile != "" {
-		cmd.Fail("cert-checker does not support checking against blocked key files")
-	}
-	kp, err := sagoodkey.NewKeyPolicy(&config.CertChecker.GoodKey, nil)
+	kp, err := sagoodkey.NewPolicy(&config.CertChecker.GoodKey, nil)
 	cmd.FailOnError(err, "Unable to create key policy")
 
 	saDbMap, err := sa.InitWrappedDb(config.CertChecker.DB, prometheus.DefaultRegisterer, logger)
@@ -617,7 +598,7 @@ func main() {
 
 	fmt.Fprintf(os.Stderr, "# Processing certificates using %d workers\n", config.CertChecker.Workers)
 	wg := new(sync.WaitGroup)
-	for i := 0; i < config.CertChecker.Workers; i++ {
+	for range config.CertChecker.Workers {
 		wg.Add(1)
 		go func() {
 			s := checker.clock.Now()

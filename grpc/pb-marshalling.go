@@ -10,9 +10,9 @@ import (
 	"net"
 	"time"
 
+	"github.com/go-jose/go-jose/v4"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/protobuf/types/known/timestamppb"
-	"gopkg.in/go-jose/go-jose.v2"
 
 	"github.com/letsencrypt/boulder/core"
 	corepb "github.com/letsencrypt/boulder/core/proto"
@@ -36,7 +36,7 @@ func ProblemDetailsToPB(prob *probs.ProblemDetails) (*corepb.ProblemDetails, err
 	return &corepb.ProblemDetails{
 		ProblemType: string(prob.Type),
 		Detail:      prob.Detail,
-		HttpStatus:  int32(prob.HTTPStatus),
+		HttpStatus:  int32(prob.HTTPStatus), //nolint: gosec // HTTP status codes are guaranteed to be small, no risk of overflow.
 	}, nil
 }
 
@@ -83,7 +83,6 @@ func ChallengeToPB(challenge core.Challenge) (*corepb.Challenge, error) {
 		Type:              string(challenge.Type),
 		Status:            string(challenge.Status),
 		Token:             challenge.Token,
-		KeyAuthorization:  challenge.ProvidedKeyAuthorization,
 		Error:             prob,
 		Validationrecords: recordAry,
 		Validated:         validated,
@@ -124,9 +123,6 @@ func PBToChallenge(in *corepb.Challenge) (challenge core.Challenge, err error) {
 		ValidationRecord: recordAry,
 		Validated:        validated,
 	}
-	if in.KeyAuthorization != "" {
-		ch.ProvidedKeyAuthorization = in.KeyAuthorization
-	}
 	return ch, nil
 }
 
@@ -145,7 +141,7 @@ func ValidationRecordToPB(record core.ValidationRecord) (*corepb.ValidationRecor
 		return nil, err
 	}
 	return &corepb.ValidationRecord{
-		Hostname:          record.Hostname,
+		Hostname:          record.DnsName,
 		Port:              record.Port,
 		AddressesResolved: addrs,
 		AddressUsed:       addrUsed,
@@ -173,7 +169,7 @@ func PBToValidationRecord(in *corepb.ValidationRecord) (record core.ValidationRe
 		return
 	}
 	return core.ValidationRecord{
-		Hostname:          in.Hostname,
+		DnsName:           in.Hostname,
 		Port:              in.Port,
 		AddressesResolved: addrs,
 		AddressUsed:       addrUsed,
@@ -183,7 +179,7 @@ func PBToValidationRecord(in *corepb.ValidationRecord) (record core.ValidationRe
 	}, nil
 }
 
-func ValidationResultToPB(records []core.ValidationRecord, prob *probs.ProblemDetails) (*vapb.ValidationResult, error) {
+func ValidationResultToPB(records []core.ValidationRecord, prob *probs.ProblemDetails, perspective, rir string) (*vapb.ValidationResult, error) {
 	recordAry := make([]*corepb.ValidationRecord, len(records))
 	var err error
 	for i, v := range records {
@@ -192,13 +188,15 @@ func ValidationResultToPB(records []core.ValidationRecord, prob *probs.ProblemDe
 			return nil, err
 		}
 	}
-	marshalledProbs, err := ProblemDetailsToPB(prob)
+	marshalledProb, err := ProblemDetailsToPB(prob)
 	if err != nil {
 		return nil, err
 	}
 	return &vapb.ValidationResult{
-		Records:  recordAry,
-		Problems: marshalledProbs,
+		Records:     recordAry,
+		Problem:     marshalledProb,
+		Perspective: perspective,
+		Rir:         rir,
 	}, nil
 }
 
@@ -214,7 +212,7 @@ func pbToValidationResult(in *vapb.ValidationResult) ([]core.ValidationRecord, *
 			return nil, nil, err
 		}
 	}
-	prob, err := PBToProblemDetails(in.Problems)
+	prob, err := PBToProblemDetails(in.Problem)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -226,15 +224,7 @@ func RegistrationToPB(reg core.Registration) (*corepb.Registration, error) {
 	if err != nil {
 		return nil, err
 	}
-	ipBytes, err := reg.InitialIP.MarshalText()
-	if err != nil {
-		return nil, err
-	}
 	var contacts []string
-	// Since the default value of corepb.Registration.Contact is a slice
-	// we need a indicator as to if the value is actually important on
-	// the other side (pb -> reg).
-	contactsPresent := reg.Contact != nil
 	if reg.Contact != nil {
 		contacts = *reg.Contact
 	}
@@ -247,14 +237,12 @@ func RegistrationToPB(reg core.Registration) (*corepb.Registration, error) {
 	}
 
 	return &corepb.Registration{
-		Id:              reg.ID,
-		Key:             keyBytes,
-		Contact:         contacts,
-		ContactsPresent: contactsPresent,
-		Agreement:       reg.Agreement,
-		InitialIP:       ipBytes,
-		CreatedAt:       createdAt,
-		Status:          string(reg.Status),
+		Id:        reg.ID,
+		Key:       keyBytes,
+		Contact:   contacts,
+		Agreement: reg.Agreement,
+		CreatedAt: createdAt,
+		Status:    string(reg.Status),
 	}, nil
 }
 
@@ -264,36 +252,20 @@ func PbToRegistration(pb *corepb.Registration) (core.Registration, error) {
 	if err != nil {
 		return core.Registration{}, err
 	}
-	var initialIP net.IP
-	err = initialIP.UnmarshalText(pb.InitialIP)
-	if err != nil {
-		return core.Registration{}, err
-	}
 	var createdAt *time.Time
 	if !core.IsAnyNilOrZero(pb.CreatedAt) {
 		c := pb.CreatedAt.AsTime()
 		createdAt = &c
 	}
 	var contacts *[]string
-	if pb.ContactsPresent {
-		if len(pb.Contact) != 0 {
-			contacts = &pb.Contact
-		} else {
-			// When gRPC creates an empty slice it is actually a nil slice. Since
-			// certain things boulder uses, like encoding/json, differentiate between
-			// these we need to de-nil these slices. Without this we are unable to
-			// properly do registration updates as contacts would always be removed
-			// as we use the difference between a nil and empty slice in ra.mergeUpdate.
-			empty := []string{}
-			contacts = &empty
-		}
+	if len(pb.Contact) != 0 {
+		contacts = &pb.Contact
 	}
 	return core.Registration{
 		ID:        pb.Id,
 		Key:       &key,
 		Contact:   contacts,
 		Agreement: pb.Agreement,
-		InitialIP: initialIP,
 		CreatedAt: createdAt,
 		Status:    core.AcmeStatus(pb.Status),
 	}, nil
@@ -317,12 +289,13 @@ func AuthzToPB(authz core.Authorization) (*corepb.Authorization, error) {
 	}
 
 	return &corepb.Authorization{
-		Id:             authz.ID,
-		Identifier:     authz.Identifier.Value,
-		RegistrationID: authz.RegistrationID,
-		Status:         string(authz.Status),
-		Expires:        expires,
-		Challenges:     challs,
+		Id:                     authz.ID,
+		DnsName:                authz.Identifier.Value,
+		RegistrationID:         authz.RegistrationID,
+		Status:                 string(authz.Status),
+		Expires:                expires,
+		Challenges:             challs,
+		CertificateProfileName: authz.CertificateProfileName,
 	}, nil
 }
 
@@ -341,12 +314,13 @@ func PBToAuthz(pb *corepb.Authorization) (core.Authorization, error) {
 		expires = &c
 	}
 	authz := core.Authorization{
-		ID:             pb.Id,
-		Identifier:     identifier.ACMEIdentifier{Type: identifier.DNS, Value: pb.Identifier},
-		RegistrationID: pb.RegistrationID,
-		Status:         core.AcmeStatus(pb.Status),
-		Expires:        expires,
-		Challenges:     challs,
+		ID:                     pb.Id,
+		Identifier:             identifier.NewDNS(pb.DnsName),
+		RegistrationID:         pb.RegistrationID,
+		Status:                 core.AcmeStatus(pb.Status),
+		Expires:                expires,
+		Challenges:             challs,
+		CertificateProfileName: pb.CertificateProfileName,
 	}
 	return authz, nil
 }
@@ -366,7 +340,7 @@ func orderValid(order *corepb.Order) bool {
 // `order.CertificateSerial` to be nil such that it can be used in places where
 // the order has not been finalized yet.
 func newOrderValid(order *corepb.Order) bool {
-	return !(order.RegistrationID == 0 || order.Expires == nil || len(order.Names) == 0)
+	return !(order.RegistrationID == 0 || order.Expires == nil || len(order.DnsNames) == 0)
 }
 
 func CertToPB(cert core.Certificate) *corepb.Certificate {
@@ -421,14 +395,14 @@ func PBToCertStatus(pb *corepb.CertificateStatus) core.CertificateStatus {
 
 // PBToAuthzMap converts a protobuf map of domains mapped to protobuf authorizations to a
 // golang map[string]*core.Authorization.
-func PBToAuthzMap(pb *sapb.Authorizations) (map[string]*core.Authorization, error) {
-	m := make(map[string]*core.Authorization, len(pb.Authz))
-	for _, v := range pb.Authz {
-		authz, err := PBToAuthz(v.Authz)
+func PBToAuthzMap(pb *sapb.Authorizations) (map[identifier.ACMEIdentifier]*core.Authorization, error) {
+	m := make(map[identifier.ACMEIdentifier]*core.Authorization, len(pb.Authzs))
+	for _, v := range pb.Authzs {
+		authz, err := PBToAuthz(v)
 		if err != nil {
 			return nil, err
 		}
-		m[v.Domain] = &authz
+		m[authz.Identifier] = &authz
 	}
 	return m, nil
 }
