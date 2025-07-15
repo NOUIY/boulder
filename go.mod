@@ -19,7 +19,7 @@ require (
 	github.com/letsencrypt/challtestsrv v1.3.3
 	github.com/letsencrypt/pkcs11key/v4 v4.0.0
 	github.com/letsencrypt/validator/v10 v10.0.0-20230215210743-a0c7dfc17158
-	github.com/miekg/dns v1.1.61
+	github.com/miekg/dns v1.1.67
 	github.com/miekg/pkcs11 v1.1.1
 	github.com/nxadm/tail v1.4.11
 	github.com/prometheus/client_golang v1.22.0
@@ -85,9 +85,9 @@ require (
 	go.opentelemetry.io/otel/exporters/otlp/otlptrace v1.36.0 // indirect
 	go.opentelemetry.io/otel/metric v1.36.0 // indirect
 	go.opentelemetry.io/proto/otlp v1.6.0 // indirect
-	golang.org/x/mod v0.22.0 // indirect
+	golang.org/x/mod v0.24.0 // indirect
 	golang.org/x/sys v0.33.0 // indirect
-	golang.org/x/tools v0.29.0 // indirect
+	golang.org/x/tools v0.33.0 // indirect
 	google.golang.org/genproto/googleapis/api v0.0.0-20250519155744-55703ea1f237 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20250519155744-55703ea1f237 // indirect
 	gopkg.in/tomb.v1 v1.0.0-20141024135613-dd632973f1e7 // indirect
