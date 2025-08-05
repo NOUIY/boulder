@@ -19,7 +19,7 @@ require (
 	github.com/letsencrypt/challtestsrv v1.3.3
 	github.com/letsencrypt/pkcs11key/v4 v4.0.0
 	github.com/letsencrypt/validator/v10 v10.0.0-20230215210743-a0c7dfc17158
-	github.com/miekg/dns v1.1.61
+	github.com/miekg/dns v1.1.66
 	github.com/miekg/pkcs11 v1.1.1
 	github.com/nxadm/tail v1.4.11
 	github.com/prometheus/client_golang v1.22.0
