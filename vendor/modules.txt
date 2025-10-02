@@ -217,8 +217,8 @@ github.com/letsencrypt/pkcs11key/v4
 # github.com/letsencrypt/validator/v10 v10.0.0-20230215210743-a0c7dfc17158
 ## explicit; go 1.18
 github.com/letsencrypt/validator/v10
-# github.com/miekg/dns v1.1.61
-## explicit; go 1.19
+# github.com/miekg/dns v1.1.68
+## explicit; go 1.23.0
 github.com/miekg/dns
 # github.com/miekg/pkcs11 v1.1.1
 ## explicit; go 1.12
